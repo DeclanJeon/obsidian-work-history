@@ -23,13 +23,13 @@ Safety contract:
   happens inside the lock so the last writer sees every published bundle.
 - Every write goes through plan → compare-hash → temporary file →
   ``os.replace``. If a target changed between plan and commit (ambiguous
-  write), the event bundle is kept and that update is skipped instead of
-  overwriting user content; conflicts are reported as an error.
+  write), the event bundle is kept and the ENTIRE publication aborts with
+  zero writes; the commit hash is also rechecked inside the temp staging
+  window immediately before each ``os.replace``.
 - Excluded artifacts (blank ``snapshot_path``/``sha256`` rows joined to
   ``event.json.excluded_artifacts[]`` by ``record_id``) render as explicit
-  excluded/incomplete provenance — never as missing files.
-- Snapshot paths with escapes (``..``, absolute, drive letters) and any
-  symlinked vault path are refused.
+  excluded/incomplete provenance; a blank row without matching exclusion
+  metadata fails closed instead of rendering as a missing file.
 """
 import argparse
 import contextlib
@@ -39,11 +39,13 @@ import hashlib
 import io
 import json
 import os
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 import re
 import sys
 import tempfile
 import time
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import history  # noqa: E402  (Task 1 event core)
@@ -203,7 +205,15 @@ def read_bundles(vault, project_folder=None):
         slug, year, _events_dir, date, event_id = parts
         if not (YEAR_FORMAT.fullmatch(year) and DATE_FORMAT.fullmatch(date)):
             raise ValueError(f"unexpected event directory shape: {folder}")
-        event_rows = [row for row in records if row.get("role") == "event"]
+        if year != date[:4]:
+            raise ValueError(
+                f"year folder {year} disagrees with event date {date}: "
+                f"{folder}")
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError(
+                f"impossible calendar date in event path: {folder}") from error
         if len(event_rows) != 1:
             raise ValueError(
                 f"event bundle must have exactly one event row: {folder}")
@@ -224,6 +234,11 @@ def read_bundles(vault, project_folder=None):
                 exclusions[item["record_id"]] = item
         artifacts = [(row, exclusions.get(row.get("record_id")))
                      for row in records if row.get("role") != "event"]
+        for row, exclusion in artifacts:
+            if not (row.get("snapshot_path") or "") and exclusion is None:
+                raise ValueError(
+                    f"blank-snapshot row {row.get('record_id')} has no "
+                    f"matching event.json excluded_artifacts entry: {folder}")
         events.append(dict(
             slug=slug, year=year, date=date, event_id=event_id,
             rel_bundle=folder.relative_to(vault).as_posix(),
@@ -341,8 +356,9 @@ def render_projects(projects, emitter):
     for entry in projects:
         span = (entry["first"] if entry["first"] == entry["last"]
                 else f"{entry['first']} → {entry['last']}")
+        dest = (history.HISTORY_DIRNAME + "/" + entry["slug"] + "/README")
         lines.append(
-            f"- {emitter.link(entry['slug'] + '/README', entry['project'])}"
+            f"- {emitter.link(dest, entry['project'])}"
             f" — slug `{entry['slug']}` · {entry['count']} event(s) · {span}")
     return "\n".join(lines) + "\n"
 
@@ -478,8 +494,12 @@ def plan_updates(vault, project_folder=None):
 # ---------- committing ----------
 
 
-def atomic_write(path, content):
-    """Write via same-directory temp file + os.replace (atomic)."""
+def atomic_write(path, content, expected_sha256):
+    """Write via same-directory temp file + os.replace (atomic).
+
+    Re-checks the target hash immediately before replacing: a concurrent
+    write landing mid-staging raises IndexConflict instead of overwriting.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=".tmp-index-", suffix=".part",
                                      dir=str(path.parent))
@@ -487,6 +507,10 @@ def atomic_write(path, content):
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(content)
+        current = path.read_bytes() if path.is_file() else None
+        current_sha = sha256_bytes(current) if current is not None else None
+        if current_sha != expected_sha256:
+            raise IndexConflict([path])
         os.replace(temp_path, path)
     finally:
         if temp_path.exists():
@@ -497,12 +521,15 @@ def atomic_write(path, content):
 
 
 def commit_updates(updates):
-    """Apply planned updates; per-target hash re-check guards user edits.
+    """All-or-nothing commit: preflight every target hash, then write.
 
-    Non-conflicting updates still publish; conflicting targets are skipped
-    byte-identical and reported via IndexConflict.
+    Phase 1 validates all targets before any write — any conflict aborts the
+    entire publication with zero writes. Phase 2 rechecks each hash inside
+    atomic_write immediately before os.replace; a race detected there raises
+    IndexConflict carrying the targets already written (partial state is
+    surfaced, never silently overwritten).
     """
-    written, conflicts = [], []
+    pending = []
     for update in updates:
         check_write_target(update.path, update.vault)
         current = (update.path.read_bytes()
@@ -511,56 +538,123 @@ def commit_updates(updates):
             continue
         current_sha = sha256_bytes(current) if current is not None else None
         if current_sha != update.previous_sha256:
-            conflicts.append(update.path)
-            continue
-        atomic_write(update.path, update.content)
+            raise IndexConflict([update.path])
+        pending.append(update)
+    written = []
+    for update in pending:
+        try:
+            atomic_write(update.path, update.content,
+                         update.previous_sha256)
+        except IndexConflict as conflict:
+            conflict.written = [str(path) for path in written]
+            raise
         written.append(update.path)
-    if conflicts:
-        raise IndexConflict(conflicts, written)
     return written
+
+def _pid_alive(pid):
+    """Best-effort liveness probe for the recorded lock owner.
+
+    Anything uncertain answers True (alive) so a lock is never reclaimed on a
+    guess — a stale lock then requires manual cleanup rather than risking two
+    concurrent index writers.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            still_active = 259
+            try:
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(code))
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            return bool(ok) and code.value == still_active
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
 
 
 @contextlib.contextmanager
 def index_lock(vault):
-    """Serialize index writers; the event scan runs while holding it."""
+    """Serialize index writers; the event scan runs while holding it.
+
+    Conservative ownership: each holder writes a unique token+PID. An
+    existing lock is reclaimed ONLY when its recorded owner process is
+    demonstrably dead AND the lock is older than LOCK_STALE_SECONDS; an
+    unreadable/malformed lock or a live-owner lock is never unlinked — the
+    caller waits or fails, so cleanup stays manual rather than risking two
+    writers. Release unlinks the file only while its on-disk bytes still
+    match the token this context wrote.
+    """
     lock_path = (history.history_root(vault) / INDEX_DIRNAME / LOCK_FILENAME)
     # Validate ancestors before creating anything: never follow a symlinked
     # "Work History" or "_index" into another directory.
     ensure_inside_vault(lock_path, vault)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     check_write_target(lock_path, vault)
+    token = uuid.uuid4().hex
+    mine = json.dumps({"token": token, "pid": os.getpid(),
+                       "acquired": time.time()}).encode("utf-8")
     deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-    fd = None
-    while fd is None:
+    while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
+            fd = None
+        if fd is not None:
+            break
+        try:
+            holder_bytes = lock_path.read_bytes()
+            holder = json.loads(holder_bytes.decode("utf-8"))
+            age = time.time() - lock_path.stat().st_mtime
+        except (OSError, ValueError):
+            holder, age = None, 0.0
+        holder_pid = holder.get("pid") if isinstance(holder, dict) else None
+        # Reclaim only a demonstrably dead, stale owner. A live PID is never
+        # unlinked; unreadable/malformed locks are never unlinked either.
+        if (isinstance(holder, dict) and isinstance(holder_pid, int)
+                and not _pid_alive(holder_pid) and age > LOCK_STALE_SECONDS):
             try:
-                age = time.time() - lock_path.stat().st_mtime
-            except OSError:
-                continue
-            if age > LOCK_STALE_SECONDS:
-                try:
+                # Token-compare before unlink: never remove a lock that was
+                # replaced since we read it.
+                if lock_path.read_bytes() == holder_bytes:
                     lock_path.unlink()
-                except OSError:
-                    pass
-                continue
-            if time.monotonic() > deadline:
-                raise ValueError(f"index lock is held: {lock_path}")
-            time.sleep(0.05)
+                    continue
+            except OSError:
+                pass
+        if time.monotonic() > deadline:
+            raise ValueError(f"index lock is held: {lock_path}")
+        time.sleep(0.05)
     try:
-        os.write(fd, json.dumps({"pid": os.getpid(),
-                                 "acquired": time.time()}).encode("utf-8"))
+        os.write(fd, mine)
     finally:
         os.close(fd)
     try:
         yield
     finally:
         try:
-            lock_path.unlink()
+            # Release only our own lock: if another owner's file replaced
+            # it, our bytes no longer match and we leave it alone.
+            if lock_path.read_bytes() == mine:
+                lock_path.unlink()
         except OSError:
             pass
-
 
 def rebuild(vault, project_folder=None):
     """Lock → plan (event scan inside the lock) → atomic commit."""
