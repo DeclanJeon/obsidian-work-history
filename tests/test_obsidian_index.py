@@ -1,4 +1,5 @@
 import csv
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -131,7 +132,7 @@ class ObsidianIndexTests(unittest.TestCase):
             event_dir = Path(result["event_path"])
             expected_dest = (event_dir / "record").relative_to(self.vault).as_posix()
             self.assertIn(f"[[{expected_dest}", text)
-        for fragment in (first["title"], second["title"], "started", "completed"):
+        for fragment in ("first", "second", "started", "completed"):
             self.assertIn(fragment, text)
         # The UTC instant is shown, not a recomputed local time.
         self.assertIn(first["recorded_at"][11:16], text)
@@ -164,13 +165,13 @@ class ObsidianIndexTests(unittest.TestCase):
         text = note_path.read_text(encoding="utf-8")
         self.assertIn(prior.rstrip("\n"), text)
         self.assertEqual(text.count(MANAGED_START), 1)
-        self.assertIn(first["title"], text)
+        self.assertIn("기록 제목", text)
         # A second event regenerates only the managed block; prose survives.
         second = self.record(title="second")
         self.view()
         text = note_path.read_text(encoding="utf-8")
         self.assertIn(prior.rstrip("\n"), text)
-        self.assertIn(second["title"], text)
+        self.assertIn("second", text)
         self.assertEqual(text.count(MANAGED_START), 1, text)
         self.assertEqual(text.count(MANAGED_END), 1, text)
 
@@ -245,7 +246,7 @@ class ObsidianIndexTests(unittest.TestCase):
         self.assertEqual(self.destinations(text).count(day_dest), 1, text)
         # New managed prose (event listings) is present without repeating
         # the [[<day-note>]] destination.
-        self.assertIn(result["title"], text)
+        self.assertIn("linked-day", text)
         self.assert_no_duplicate_destinations(readme)
 
     def test_generated_content_dedupes_by_destination_not_line_text(self):
