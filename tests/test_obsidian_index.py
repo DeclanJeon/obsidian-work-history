@@ -681,9 +681,11 @@ class ObsidianIndexTests(unittest.TestCase):
                      "parents": [], "artifacts": []}
 
         def excluded_row(**overrides):
-            return self.base_row("craft", event_id, record_id="r1",
-                                 role="document", source_path=source,
-                                 snapshot_path="", sha256="", **overrides)
+            row = self.base_row("craft", event_id, record_id="r1",
+                                role="document", source_path=source,
+                                snapshot_path="", sha256="")
+            row.update(overrides)
+            return row
 
         variants = [
             # name, row overrides, event.json excluded_artifacts value
