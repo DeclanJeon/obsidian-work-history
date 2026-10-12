@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -199,28 +200,38 @@ class ObsidianIndexTests(unittest.TestCase):
 
     # --- Required scenario: hash conflict aborts that update ---
 
-    def test_changed_file_conflict_aborts_that_update(self):
+    def test_changed_file_conflict_aborts_entire_publication(self):
         self.record()
         self.view()
         module = load_index_module()
         # Simulate a non-cooperating external writer: the note changes between
-        # the index plan and its atomic commit.
+        # the index plan and its commit.
         events_csv = self.root() / "_index" / "events.csv"
         events_csv.unlink()
         plan = module.plan_updates(self.vault)
         day_update = next(u for u in plan
                           if Path(u.path).name.endswith(".md")
                           and u.path.parent.name.isdigit())
+        # Pre-commit state of every planned target (absent → None).
+        before = {}
+        for update in plan:
+            before[update.path] = (update.path.read_bytes()
+                                   if update.path.is_file() else None)
         external = (Path(day_update.path).read_text(encoding="utf-8")
                     + "\nexternal edit\n")
         Path(day_update.path).write_text(external, encoding="utf-8")
+        before[day_update.path] = external.encode("utf-8")
         with self.assertRaises(module.IndexConflict):
             module.commit_updates(plan)
-        # The user edit wins; the conflicted file is byte-identical.
-        self.assertEqual(Path(day_update.path).read_text(encoding="utf-8"),
-                         external)
-        # Non-conflicting updates still publish.
-        self.assertTrue(events_csv.is_file())
+        # Any target conflict aborts the WHOLE publication: every target
+        # keeps its pre-commit bytes — including events.csv, which stays
+        # absent — and the event bundle is preserved untouched.
+        for path, snapshot in before.items():
+            current = path.read_bytes() if path.is_file() else None
+            self.assertEqual(current, snapshot, f"index wrote over {path}")
+        self.assertFalse(events_csv.exists())
+        event_dir = next((self.root()).rglob("records.csv"))
+        self.assertTrue(event_dir.is_file())
 
     # --- Required scenario: destination-based wikilink deduplication ---
     # The real defect: an existing [[<day-note>]] target in project-note
@@ -389,8 +400,11 @@ class ObsidianIndexTests(unittest.TestCase):
         slug_a, slug_b = self.slug_of("Alpha"), self.slug_of("Beta")
         index_dir = self.root() / "_index"
         projects_md = (index_dir / "projects.md").read_text(encoding="utf-8")
-        self.assertIn(f"[[{slug_a}/README", projects_md)
-        self.assertIn(f"[[{slug_b}/README", projects_md)
+        self.assertIn(f"[[Work History/{slug_a}/README", projects_md)
+        self.assertIn(f"[[Work History/{slug_b}/README", projects_md)
+        # Destinations resolve to the actual project README notes.
+        for link in self.destinations(projects_md):
+            self.assertTrue((self.vault / f"{link}.md").is_file(), link)
         self.assert_no_duplicate_destinations(index_dir / "projects.md")
         projects = {row["project"]: row for row in
                     self.read_csv(index_dir / "projects.csv")}
@@ -458,6 +472,166 @@ class ObsidianIndexTests(unittest.TestCase):
         self.assertEqual(outside.read_text(encoding="utf-8"),
                          "outside content\n")
         self.assertTrue(note_path.is_symlink())
+
+    # --- Review: race between commit check and atomic replace ---
+
+    def test_race_during_atomic_write_rechecks_before_replace(self):
+        self.record()
+        self.view()
+        module = load_index_module()
+        events_csv = self.root() / "_index" / "events.csv"
+        events_csv.unlink()
+        plan = module.plan_updates(self.vault)
+        raced = next(u for u in plan if u.path == events_csv)
+        original = module.atomic_write
+
+        def racing_write(path, *args, **kwargs):
+            if path == raced.path:
+                # External edit lands after commit's first hash check but
+                # inside staging — before os.replace.
+                Path(path).write_text("raced\n", encoding="utf-8")
+            return original(path, *args, **kwargs)
+
+        module.atomic_write = racing_write
+        self.addCleanup(setattr, module, "atomic_write", original)
+        with self.assertRaises(module.IndexConflict):
+            module.commit_updates(plan)
+        # The external bytes win; the second compare before replace refused.
+        self.assertEqual(events_csv.read_text(encoding="utf-8"), "raced\n")
+
+    # --- Review: lock owner safety ---
+
+    def test_live_lock_is_never_treated_as_stale(self):
+        self.record()
+        module = load_index_module()
+        module.LOCK_TIMEOUT_SECONDS = 0.4
+        lock_path = (self.root() / "_index" / module.LOCK_FILENAME)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # An ancient lock file that belongs to a LIVE process (us) must be
+        # refused, never unlinked as "stale".
+        lock_path.write_text(json.dumps({"pid": os.getpid()}),
+                             encoding="utf-8")
+        old = time.time() - 86400
+        os.utime(lock_path, (old, old))
+        with self.assertRaises(ValueError):
+            with module.index_lock(self.vault):
+                pass
+        self.assertTrue(lock_path.is_file(), "live lock must not be unlinked")
+        self.assertIn(str(os.getpid()),
+                      lock_path.read_text(encoding="utf-8"))
+
+    def test_index_lock_release_never_unlinks_another_owner(self):
+        self.record()
+        module = load_index_module()
+        lock_path = (self.root() / "_index" / module.LOCK_FILENAME)
+        with module.index_lock(self.vault):
+            self.assertTrue(lock_path.is_file())
+            # A second owner's lock replaces ours while we hold the context.
+            lock_path.write_text(json.dumps({"pid": 424242, "owner": "other"}),
+                                 encoding="utf-8")
+        # Our exit must not delete the replacement lock.
+        self.assertTrue(lock_path.is_file())
+        self.assertIn("other", lock_path.read_text(encoding="utf-8"))
+
+    # --- Review: event path/date validation ---
+
+    def test_year_folder_must_match_event_local_date(self):
+        slug = "craft-" + "y" * 10
+        date = "2026-10-13"
+        event_id = "9" * 32
+        bundle = f"Work History/{slug}/1999/Events/{date}/{event_id}"
+        rows = [self.base_row("craft", event_id,
+                              snapshot_path=f"{bundle}/original.md",
+                              sha256="0" * 64)]
+        self.write_bundle(slug, date, event_id, rows, [],
+                          event_json={"event_id": event_id,
+                                    "schema_version": 1,
+                                    "project": "craft", "project_slug": slug,
+                                    "recorded_at": "2026-10-13T12:00:00+00:00",
+                                    "local_date": date, "timezone": "UTC",
+                                    "title": "t", "kind": "execution",
+                                    "status": "completed", "parents": [],
+                                    "excluded_artifacts": [], "artifacts": []},
+                          year="1999")
+        error = self.view(ok=False)
+        self.assertIn("error", error)
+        self.assertFalse((self.root() / "_index" / "events.csv").exists())
+        self.assertFalse(self.day_note(slug, date).exists())
+
+    def test_impossible_local_date_is_refused(self):
+        slug = "craft-" + "z" * 10
+        date = "2026-02-30"  # impossible calendar date
+        event_id = "8" * 32
+        bundle = f"Work History/{slug}/2026/Events/{date}/{event_id}"
+        rows = [self.base_row("craft", event_id, local_date=date,
+                              snapshot_path=f"{bundle}/original.md",
+                              sha256="0" * 64)]
+        self.write_bundle(slug, date, event_id, rows, [],
+                          event_json={"event_id": event_id,
+                                    "schema_version": 1,
+                                    "project": "craft", "project_slug": slug,
+                                    "recorded_at": "2026-02-28T12:00:00+00:00",
+                                    "local_date": date, "timezone": "UTC",
+                                    "title": "t", "kind": "execution",
+                                    "status": "completed", "parents": [],
+                                    "excluded_artifacts": [], "artifacts": []})
+        error = self.view(ok=False)
+        self.assertIn("error", error)
+        self.assertFalse(self.day_note(slug, date).exists())
+        self.assertFalse((self.root() / "_index" / "events.csv").exists())
+
+    # --- Review: exclusion rows require exclusion metadata ---
+
+    def test_blank_snapshot_row_without_exclusion_metadata_fails_closed(self):
+        slug = "craft-" + "x" * 10
+        date = "2026-10-13"
+        event_id = "7" * 32
+        bundle = f"Work History/{slug}/2026/Events/{date}/{event_id}"
+
+        def rows_for(eid):
+            return [self.base_row("craft", eid,
+                                  snapshot_path=f"{bundle}/original.md",
+                                  sha256="0" * 64),
+                    self.base_row("craft", eid, record_id="r1",
+                                  role="document", source_path="/tmp/doc.bin",
+                                  snapshot_path="", sha256="")]
+
+        def links_for(eid):
+            return [dict(source_id=eid, target_id="r1", relation="used")]
+
+        base_json = {"schema_version": 1, "project": "craft",
+                     "project_slug": slug,
+                     "recorded_at": "2026-10-13T12:00:00+00:00",
+                     "local_date": date, "timezone": "UTC", "title": "t",
+                     "kind": "execution", "status": "completed",
+                     "parents": [], "artifacts": []}
+        # Variant 1: excluded_artifacts entry missing entirely.
+        self.write_bundle(slug, date, event_id, rows_for(event_id),
+                          links_for(event_id),
+                          event_json={**base_json, "event_id": event_id,
+                                      "excluded_artifacts": []})
+        error = self.view(ok=False)
+        self.assertIn("error", error)
+        self.assertFalse((self.root() / "_index" / "events.csv").exists())
+        self.assertFalse(self.day_note(slug, date).exists())
+        # Variant 2: no event.json at all.
+        self.write_bundle(slug, date, "6" * 32, rows_for("6" * 32),
+                          links_for("6" * 32), event_json=None)
+        self.view(ok=False)
+        self.assertFalse((self.root() / "_index" / "events.csv").exists())
+        # Variant 3: mismatched record_id in excluded_artifacts.
+        self.write_bundle(slug, date, "5" * 32, rows_for("5" * 32),
+                          links_for("5" * 32),
+                          event_json={**base_json, "event_id": "5" * 32,
+                                      "excluded_artifacts": [
+                                          {"record_id": "someone-else",
+                                           "role": "document",
+                                           "source_path": "/tmp/doc.bin",
+                                           "sha256": "2" * 64,
+                                           "reason": "x"}]})
+        self.view(ok=False)
+        self.assertFalse((self.root() / "_index" / "events.csv").exists())
+        self.assertFalse(self.day_note(slug, date).exists())
 
     # --- Incomplete bundles fail safely ---
 
