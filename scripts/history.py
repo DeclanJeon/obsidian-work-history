@@ -241,19 +241,20 @@ def record(args):
     for role, path in files:
         source_bytes = path.read_bytes()
         source_sha = hashlib.sha256(source_bytes).hexdigest()
+        reason = None
         if looks_binary(source_bytes):
-            excluded.append(dict(role=role, source_path=str(path),
-                                 sha256=source_sha,
-                                 reason="binary artifact excluded: no approved local "
-                                        "scanner; bytes not copied"))
-            continue
-        try:
-            artifact_text = source_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            excluded.append(dict(role=role, source_path=str(path),
-                                 sha256=source_sha,
-                                 reason="artifact is not supported UTF-8 text; "
-                                        "bytes not copied"))
+            reason = ("binary artifact excluded: no approved local scanner; "
+                      "bytes not copied")
+        else:
+            try:
+                artifact_text = source_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                reason = ("artifact is not supported UTF-8 text; "
+                          "bytes not copied")
+        if reason is not None:
+            excluded.append(dict(record_id=uuid.uuid4().hex, role=role,
+                                 source_path=str(path), sha256=source_sha,
+                                 reason=reason))
             continue
         artifact_text, count = screen_text(artifact_text, path)
         redactions += count
@@ -329,6 +330,17 @@ def record(args):
                                   source_sha256=source_sha))
             links.append(dict(source_id=event_id, target_id=artifact_id,
                               relation="produced" if role == "output" else "used"))
+        for item in excluded:
+            # Excluded artifacts are provenance records, not snapshots:
+            # blank snapshot_path/sha256 — the source digest lives only in
+            # event.json excluded_artifacts[].sha256.
+            rows.append(dict(common, event_id=event_id,
+                             record_id=item["record_id"], role=item["role"],
+                             source_path=item["source_path"],
+                             snapshot_path="", sha256=""))
+            links.append(dict(source_id=event_id, target_id=item["record_id"],
+                              relation=("produced" if item["role"] == "output"
+                                        else "used")))
         write_csv(stage / "records.csv", RECORD_FIELDS, rows)
         write_csv(stage / "links.csv", LINK_FIELDS, links)
         (stage / "event.json").write_text(json.dumps(

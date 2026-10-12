@@ -70,13 +70,12 @@ python scripts/history.py index [--vault PATH] [--project IDENTITY]
 
 - `--text-file`과 모든 `--input`/`--document`/`--output` 텍스트 아티팩트는 저장 전 결정적 검사를 거친다. 인식된 비밀 값(GitHub 토큰, `sk-`/`api-`/`token-`/`secret-`/`key-`/`password-` 계열 토큰, AWS `AKIA…`, Slack `xox…`, `Bearer` 토큰, JWT, 자격증명 포함 DB URL, `-----BEGIN … PRIVATE KEY-----` 블록)은 값만 `[REDACTED]`로 치환한다. BEGIN/END 마커가 맞지 않는 등 **모호한 내용은 그 이벤트 전체를 거부한다(실패 폐쇄)**.
 - 저장되는 바이트는 치환된 UTF-8 텍스트다. `records.csv`의 `sha256`은 저장된 바이트 기준이며, 소스 바이트의 SHA-256은 `event.json`의 `source_sha256`(이벤트) 및 `artifacts[].source_sha256`(파일)에 출처로 남는다. `record.md`에 `redactions`·`excluded_artifacts` 수를 적는다.
-- NUL 바이트를 포함하거나 UTF-8이 아닌 아티팩트는 **바이너리로 취급해 복사하지 않는다**. `event.json`의 `excluded_artifacts[]`에 `role`, `source_path`, 소스 `sha256`, `reason`을 기록하고 `records.csv`에는 스냅샷 행을 만들지 않는다. 미검사 바이너리를 복사했다고 주장하지 않는다.
+- NUL 바이트를 포함하거나 UTF-8이 아닌 아티팩트는 **바이너리로 취급해 복사하지 않는다**. 제외도 일급 출처 레코드다: `records.csv`에 `snapshot_path`·`sha256`이 빈 값인 행(저장 바이트가 없다는 명시)을 남기고 `links.csv`에 이벤트→레코드 관계(`input`/`document`는 `used`, `output`은 `produced`)를 쓴다. 소스 다이제스트는 `event.json`의 `excluded_artifacts[].sha256`에만 둔다 — 저장 스냅샷 해시로 오인하지 않는다. `event.json`의 각 제외 항목은 `record_id`, `role`, `source_path`, 소스 `sha256`, `reason`을 가진다. 미검사 바이너리를 복사했다고 주장하지 않는다.
 
 ## 저장 구조
 
 ```text
 <Vault>/Work History/
-  <project-slug>/
     project.json                         # {"schema_version", "project", "slug"}
     <YYYY>/
       Events/
@@ -124,7 +123,7 @@ CSV는 UTF-8 BOM, 표준 CSV quoting을 사용한다. 업스트림 13개 컬럼�
 | local_date | 볼트 로컬 날짜 YYYY-MM-DD |
 | timezone | local_date 산출에 쓴 시간대 (`UTC`, IANA 이름 또는 오프셋) |
 
-이벤트 행의 `snapshot_path`와 해시는 `record.md`가 아니라 `original.md`를 가리킨다. 제외된 바이너리 아티팩트는 행이 없다.
+이벤트 행의 `snapshot_path`와 해시는 `record.md`가 아니라 `original.md`를 가리킨다. 제외된 아티팩트는 `snapshot_path`와 `sha256`이 빈 행으로 남고 `event.json`의 `excluded_artifacts` 항목과 `record_id`로 연결된다.
 
 ### links.csv
 
@@ -132,7 +131,7 @@ CSV는 UTF-8 BOM, 표준 CSV quoting을 사용한다. 업스트림 13개 컬럼�
 |---|---|
 | source_id | 관계 출발 ID |
 | target_id | 관계 도착 ID |
-| relation | precedes: 이전 이벤트 → 다음 이벤트; used: 이벤트 → 입력/문서; produced: 이벤트 → 산출물 |
+| relation | precedes: 이전 이벤트 → 다음 이벤트; used: 이벤트 → 입력/문서(제외 레코드 포함); produced: 이벤트 → 산출물(제외 레코드 포함) |
 
 ## 조회·보안
 

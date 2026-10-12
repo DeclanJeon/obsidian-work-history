@@ -147,3 +147,9 @@ QA compared this proposal with the actual `history-skills` CLI, `record-format.m
 | QA: project-local `.history/` may not use the global event-bundle CSV layout. | The design separates global event-store import from project-local continuity reads; unsupported local formats are not bulk-imported without a distinct adapter and approved dry run. |
 
 The reviewed source CLI is Python 3.10+ standard-library code; current GitHub license metadata for both source repositories is `null`. No implementation, repository creation, skill removal, or deletion has been performed during this QA.
+
+## Implementation addendum (schema_version 1)
+
+- **Excluded artifacts are graph-linked provenance records.** An artifact that is binary or not supported UTF-8 text is never copied. It still receives an opaque `record_id`, a `records.csv` row with blank `snapshot_path`/`sha256` (explicitly claiming no stored bytes), and a `links.csv` edge (`used` for input/document, `produced` for output). `event.json.excluded_artifacts[]` carries `record_id`, `role`, `source_path`, the source `sha256` (provenance only — never the stored-snapshot hash), and `reason`.
+- **Text screening.** `--text-file` and text artifacts pass deterministic redaction of known secret forms before staging; ambiguous matches fail the record closed. Stored bytes are sanitized UTF-8; `records.csv` `sha256` is the stored-bytes digest and `event.json` keeps `source_sha256`/`artifacts[].source_sha256` plus a `redactions` count.
+- **CLI note.** `--utc-offset` must be passed with `=` syntax (`--utc-offset=-04:00`) because argparse otherwise reads a leading `-` as a new option.
