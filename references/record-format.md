@@ -95,7 +95,7 @@ python scripts/history.py index [--vault PATH] [--project IDENTITY]
 
 이벤트는 대상 날짜 폴더 안의 `.pending-*` 임시 디렉터리에 완성한 뒤 같은 파일시스템 내 rename으로 게시한다. 게시 실패나 중단으로 남은 `.pending-*`는 미게시 기록이며 `index`에 포함되지 않고 자동 완료·삭제하지 않는다. `snapshot_path`는 볼트 루트 기준 POSIX 상대 경로다.
 
-`index`는 게시 완료 이벤트를 모아 `Work History/_index/snapshots/` 아래 새 CSV 스냅샷을 원자적으로 쓴다. 병렬 작업이 진행 중이면 이후 게시 이벤트는 빠질 수 있으므로 납품 직전 모든 writer가 끝난 뒤 다시 실행한다. 날짜별/프로젝트 Obsidian 뷰 생성은 별도 단계가 담당한다.
+`index`는 게시 완료 이벤트를 모아 `Work History/_index/snapshots/` 아래 새 CSV 스냅샷을 원자적으로 쓴다. 병렬 작업이 진행 중이면 이후 게시 이벤트는 빠질 수 있으므로 납품 직전 모든 writer가 끝난 뒤 다시 실행한다. 날짜별·프로젝트·전역 Obsidian 뷰는 `scripts/obsidian_index.py index`가 생성한다 — 레이아웃·관리 마커·링크 중복 제거·실패 안전 규칙은 [obsidian-layout.md](obsidian-layout.md)를 참고한다.
 
 ## CSV 스키마 (schema_version 1)
 
