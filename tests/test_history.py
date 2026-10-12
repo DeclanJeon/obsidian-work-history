@@ -95,17 +95,32 @@ class HistoryTests(unittest.TestCase):
                 data = file.read_bytes()
                 self.assertNotIn(b"MAGICBYTES", data, file)
                 self.assertNotEqual(hashlib.sha256(data).hexdigest(), digest, file)
-        # The exclusion is surfaced truthfully: source digest recorded from the
-        # source read, role/path kept, reason stated — never claimed as copied.
+        # The exclusion is a first-class metadata record: opaque record_id,
+        # source digest + reason in event.json, a records.csv row with NO
+        # snapshot claims, and a used link from this event.
         event = json.loads((event_dir / "event.json").read_text(encoding="utf-8"))
         exclusions = event.get("excluded_artifacts", [])
-        self.assertTrue(any(e["source_path"] == str(binary.resolve())
-                            and e["sha256"] == digest and e["reason"]
-                            for e in exclusions), exclusions)
+        exclusion = next((e for e in exclusions
+                          if e["source_path"] == str(binary.resolve())), None)
+        self.assertIsNotNone(exclusion, exclusions)
+        self.assertTrue(exclusion["record_id"])
+        self.assertEqual(exclusion["sha256"], digest)
+        self.assertTrue(exclusion["reason"])
         with open(event_dir / "records.csv", encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
-        self.assertFalse(any(str(binary) in r["source_path"] and r["snapshot_path"]
-                             for r in rows))
+        excluded_rows = [r for r in rows
+                         if r["record_id"] == exclusion["record_id"]]
+        self.assertEqual(len(excluded_rows), 1, rows)
+        row = excluded_rows[0]
+        self.assertEqual(row["role"], "document")
+        self.assertEqual(row["source_path"], str(binary.resolve()))
+        self.assertEqual(row["snapshot_path"], "")
+        self.assertEqual(row["sha256"], "")
+        with open(event_dir / "links.csv", encoding="utf-8-sig", newline="") as stream:
+            links = list(csv.DictReader(stream))
+        self.assertIn(dict(source_id=result["event_id"],
+                           target_id=exclusion["record_id"], relation="used"),
+                      links)
 
     # --- Ported upstream behavior ---
 
