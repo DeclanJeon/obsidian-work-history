@@ -220,7 +220,7 @@ class ObsidianIndexTests(unittest.TestCase):
         external = (Path(day_update.path).read_text(encoding="utf-8")
                     + "\nexternal edit\n")
         Path(day_update.path).write_text(external, encoding="utf-8")
-        before[day_update.path] = external.encode("utf-8")
+        before[day_update.path] = Path(day_update.path).read_bytes()
         with self.assertRaises(module.IndexConflict):
             module.commit_updates(plan)
         # Any target conflict aborts the WHOLE publication: every target
