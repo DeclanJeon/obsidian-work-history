@@ -228,17 +228,53 @@ def read_bundles(vault, project_folder=None):
         for row in records:
             validate_snapshot_path(row.get("snapshot_path") or "")
         exclusions = {}
-        raw = event_json.get("excluded_artifacts")
-        for item in raw or []:
-            if isinstance(item, dict) and item.get("record_id"):
-                exclusions[item["record_id"]] = item
-        artifacts = [(row, exclusions.get(row.get("record_id")))
-                     for row in records if row.get("role") != "event"]
-        for row, exclusion in artifacts:
-            if not (row.get("snapshot_path") or "") and exclusion is None:
+        raw = event_json.get("excluded_artifacts") or []
+        if not isinstance(raw, list):
+            raise ValueError(
+                f"event.json excluded_artifacts must be a list: {folder}")
+        exclusions = {}
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("record_id"):
                 raise ValueError(
-                    f"blank-snapshot row {row.get('record_id')} has no "
-                    f"matching event.json excluded_artifacts entry: {folder}")
+                    f"malformed excluded_artifacts entry: {folder}")
+            exclusions[item["record_id"]] = item
+        artifacts = []
+        for row in records:
+            if row.get("role") == "event":
+                continue
+            record_id = row.get("record_id") or ""
+            snapshot = row.get("snapshot_path") or ""
+            exclusion = exclusions.pop(record_id, None)
+            if snapshot:
+                if exclusion is not None:
+                    raise ValueError(
+                        f"snapshotted row {record_id} also has "
+                        f"excluded_artifacts metadata: {folder}")
+            else:
+                # A blank-snapshot row is provenance-only: it requires a
+                # one-to-one exclusion entry matching role, source_path and
+                # carrying a source digest + nonempty reason, and its CSV
+                # sha256 must stay blank (no stored bytes).
+                if (row.get("sha256") or ""):
+                    raise ValueError(
+                        f"excluded row {record_id} must have blank "
+                        f"snapshot_path AND sha256: {folder}")
+                if (exclusion is None
+                        or exclusion.get("role") != (row.get("role") or "")
+                        or exclusion.get("source_path")
+                            != (row.get("source_path") or "")
+                        or not exclusion.get("sha256")
+                        or not exclusion.get("reason")):
+                    raise ValueError(
+                        f"blank-snapshot row {record_id} has no matching "
+                        f"event.json excluded_artifacts entry (record_id, "
+                        f"role, source_path, sha256 digest, reason "
+                        f"required): {folder}")
+            artifacts.append((row, exclusion))
+        if exclusions:
+            raise ValueError(
+                f"excluded_artifacts entries without records.csv rows: "
+                f"{sorted(exclusions)} in {folder}")
         events.append(dict(
             slug=slug, year=year, date=date, event_id=event_id,
             rel_bundle=folder.relative_to(vault).as_posix(),
@@ -687,8 +723,21 @@ def main():
         result["updated"] = [
             Path(path).relative_to(vault).as_posix()
             for path in result["updated"]]
-    except (IndexConflict, ValueError, OSError, UnicodeError,
-            csv.Error) as error:
+    except IndexConflict as error:
+        # Report the exact partial state: which targets were already
+        # published and which were refused, vault-relative.
+        def relative(path):
+            try:
+                return Path(path).relative_to(vault).as_posix()
+            except (ValueError, NameError):
+                return str(path)
+        print(json.dumps(
+            {"error": str(error),
+             "conflicts": [relative(p) for p in error.conflicts],
+             "written": [relative(p) for p in error.written]},
+            ensure_ascii=False), file=sys.stderr)
+        return 2
+    except (ValueError, OSError, UnicodeError, csv.Error) as error:
         print(json.dumps({"error": str(error)}, ensure_ascii=False),
               file=sys.stderr)
         return 2
