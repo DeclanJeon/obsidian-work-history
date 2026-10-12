@@ -8,9 +8,8 @@ omp·Codex·Claude 등 파일 접근이 가능한 AI 에이전트의 제작 과�
 | 기록 ↔ 입력 자료 ↔ 산출물, 이전 단계 ↔ 다음 단계 | `records.csv` / `links.csv` + `event.json` |
 | 원본 문서·코드·이미지·영상·데이터, 중간/최종 결과 | `artifacts/`의 원래 형식 파일 스냅샷 |
 
-각 이벤트는 `<Vault>/Work History/<project-slug>/<YYYY>/Events/<YYYY-MM-DD>/<event_id>/` 아래 완성된 번들로 원자적으로 게시된다. `recorded_at`은 UTC, 날짜 경로는 볼트 로컬 시간대(`--timezone`/`--utc-offset`, 미지정 시 명확한 `UTC`)를 사용한다.
 
-## 저장 위치 해석
+각 이벤트는 `<Vault>/Work History/<project-slug>/<YYYY>/Events/<YYYY-MM-DD>/<event_id>/` 아래 완성된 번들로 원자적으로 게시된다. `recorded_at`은 UTC, 날짜 경로는 볼트 로컬 시간대(`--timezone`/`--utc-offset=±HH:MM`, 미지정 시 명확한 `UTC`)를 사용한다. 텍스트는 저장 전 알려진 비밀 형식을 `[REDACTED]`로 치환하고 모호한 내용은 거부한다. 미검사 바이너리 아티팩트는 복사하지 않고 `excluded_artifacts`로 명시한다.
 
 1. `--vault PATH`
 2. `OBSIDIAN_VAULT_PATH`

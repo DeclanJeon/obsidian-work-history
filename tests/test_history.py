@@ -74,6 +74,14 @@ class HistoryTests(unittest.TestCase):
             if file.is_file():
                 self.assertNotIn(secret.encode(), file.read_bytes(), file)
 
+    def test_ambiguous_secret_fails_closed(self):
+        # An unterminated private-key block is ambiguous: refuse the whole
+        # record rather than silently retain or destroy suspect bytes.
+        self.text.write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n",
+                             encoding="utf-8")
+        self.record(ok=False)
+        self.assertFalse((self.vault / "Work History").exists())
+
     def test_unscanned_binary_is_excluded_not_copied(self):
         binary = self.base / "blob.bin"
         payload = b"\x00\x01MAGICBYTES\xff\xfe" * 4
@@ -101,20 +109,23 @@ class HistoryTests(unittest.TestCase):
 
     # --- Ported upstream behavior ---
 
-    def test_versions_preserve_original_bytes_and_relations(self):
-        output = self.base / "result.bin"
-        output.write_bytes(b"\x00first\xff")
+    def test_versions_preserve_sanitized_bytes_and_relations(self):
+        output = self.base / "result.md"
+        first_text = "첫 번째 결과\n"
+        second_text = "두 번째 결과\n"
+        output.write_text(first_text, encoding="utf-8")
         first = self.record("--output", output, "--version", "v0001")
-        output.write_bytes(b"\x00second\xfe")
+        output.write_text(second_text, encoding="utf-8")
         second = self.record("--output", output, "--version", "v0002",
                              "--parent", first["event_id"], "--document", self.text)
         output.unlink()
         rows, links = self.index()
         outputs = {r["version"]: r for r in rows if r["role"] == "output"}
-        for version, expected in (("v0001", b"\x00first\xff"), ("v0002", b"\x00second\xfe")):
+        for version, expected in (("v0001", first_text), ("v0002", second_text)):
             row = outputs[version]
-            self.assertEqual((self.vault / row["snapshot_path"]).read_bytes(), expected)
-            self.assertEqual(row["sha256"], hashlib.sha256(expected).hexdigest())
+            stored = (self.vault / row["snapshot_path"]).read_bytes()
+            self.assertEqual(stored.decode("utf-8"), expected)
+            self.assertEqual(row["sha256"], hashlib.sha256(stored).hexdigest())
         for row in rows:
             self.assertEqual(row["title"], '한글, "제목"')
             if row["role"] == "event":
@@ -230,7 +241,7 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(event["timezone"], "Asia/Seoul")
         self.assertEqual(event["recorded_at"], result["recorded_at"])
         self.assertEqual(event["parents"], [])
-        self.assertEqual(event["original_sha256"],
+        self.assertEqual(event["source_sha256"],
                          hashlib.sha256(self.text.read_bytes()).hexdigest())
         # Slug carries a fixed-length sha-256 suffix of the canonical identity.
         suffix = rel.parts[1].rsplit("-", 1)[-1]

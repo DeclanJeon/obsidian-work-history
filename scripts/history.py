@@ -53,6 +53,45 @@ def slug(value):
     return value[:60]
 
 
+SECRET_RULES = [
+    ("github-token", re.compile(r"(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}")),
+    ("api-token", re.compile(r"\b(?:sk|pk|api|key|token|secret|password)[-_][A-Za-z0-9]{20,}")),
+    ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("bearer-token", re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
+    ("database-url", re.compile(r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|"
+                               r"redis|amqps?)://[^\s'\"]*:[^\s'\"]*@[^\s'\"]+")),
+    ("private-key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
+                               r"-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S)),
+]
+PRIVATE_KEY_MARKER = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+
+
+def screen_text(text, source):
+    """Redact recognizable secret values; fail closed on ambiguous content.
+
+    Best-effort screening of supported text only — never claims exhaustive
+    scanning. Returns (sanitized_text, redaction_count).
+    """
+    begins = len(PRIVATE_KEY_MARKER.findall(text))
+    blocks = len(SECRET_RULES[-1][1].findall(text))
+    if begins != blocks:
+        raise ValueError(
+            f"ambiguous secret-like content in {source}; record refused for review")
+    sanitized, total = text, 0
+    for _label, pattern in SECRET_RULES:
+        def repl(match):
+            prefix = match.group(1) if match.lastindex else ""
+            return prefix + "[REDACTED]"
+        sanitized, count = pattern.subn(repl, sanitized)
+        total += count
+    return sanitized, total
+
+
+def looks_binary(raw):
+    return b"\x00" in raw[:8192]
+
 def project_slug(identity):
     """Stable, collision-resistant folder name for a canonical project identity."""
     canonical = unicodedata.normalize("NFKC", identity).strip()
@@ -97,7 +136,7 @@ def local_zone(args):
     if offset is not None:
         match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", offset)
         if not match:
-            raise ValueError(f"--utc-offset must look like +09:00, got {offset!r}")
+            raise ValueError(f"--utc-offset must look like --utc-offset=+09:00, got {offset!r}")
         sign, hours, minutes = match.groups()
         delta = timedelta(hours=int(hours), minutes=int(minutes))
         if sign == "-":
@@ -187,8 +226,10 @@ def record(args):
     zone, zone_label = local_zone(args)
     text_path = Path(args.text_file).resolve(strict=True)
     raw_bytes = text_path.read_bytes()
-    text = raw_bytes.decode("utf-8-sig")
-    files = []
+    text, redactions = screen_text(raw_bytes.decode("utf-8-sig"), text_path)
+    stored_bytes = text.encode("utf-8")
+    files, excluded = [], []
+    prepared = []
     for role in ("input", "document", "output"):
         for source in getattr(args, role):
             path = Path(source).resolve(strict=True)
@@ -197,6 +238,27 @@ def record(args):
             files.append((role, path))
     if args.output and not args.version:
         raise ValueError("--version is required when recording outputs")
+    for role, path in files:
+        source_bytes = path.read_bytes()
+        source_sha = hashlib.sha256(source_bytes).hexdigest()
+        if looks_binary(source_bytes):
+            excluded.append(dict(role=role, source_path=str(path),
+                                 sha256=source_sha,
+                                 reason="binary artifact excluded: no approved local "
+                                        "scanner; bytes not copied"))
+            continue
+        try:
+            artifact_text = source_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            excluded.append(dict(role=role, source_path=str(path),
+                                 sha256=source_sha,
+                                 reason="artifact is not supported UTF-8 text; "
+                                        "bytes not copied"))
+            continue
+        artifact_text, count = screen_text(artifact_text, path)
+        redactions += count
+        prepared.append((role, path, source_sha,
+                         artifact_text.encode("utf-8")))
 
     root = history_root(vault)
     folder_name = find_project_slug(root, args.project) or project_slug(args.project)
@@ -220,8 +282,9 @@ def record(args):
                       model=args.model, version=args.version,
                       schema_version=str(SCHEMA_VERSION), project=args.project,
                       source_key=event_id, local_date=local_date, timezone=zone_label)
-        # Preserve source bytes separately from the annotated record.
-        (stage / "original.md").write_bytes(raw_bytes)
+        # Preserve only the sanitized text; secret-bearing source bytes are
+        # never staged or published.
+        (stage / "original.md").write_bytes(stored_bytes)
         metadata = {
             "event_id": event_id, "source_key": event_id,
             "schema_version": SCHEMA_VERSION,
@@ -233,38 +296,37 @@ def record(args):
         }
         lines = [f"- {key}: {json.dumps(value, ensure_ascii=False)}"
                  for key, value in metadata.items()]
+        note = (f"\n- redactions: {redactions}"
+                f"\n- excluded_artifacts: {len(excluded)}")
         (stage / "record.md").write_text(
-            "# 작업 기록\n\n" + "\n".join(lines) +
+            "# 작업 기록\n\n" + "\n".join(lines) + note +
             f"\n- parents: {json.dumps(args.parent)}\n"
             f"- exact_text_snapshot: original.md\n\n## 기록 내용\n\n{text}",
             encoding="utf-8")
         rows.append(dict(common, event_id=event_id, record_id=event_id, role="event",
                          source_path=str(text_path),
                          snapshot_path=vault_relative(destination / "original.md", vault),
-                         sha256=hashlib.sha256(raw_bytes).hexdigest()))
+                         sha256=hashlib.sha256(stored_bytes).hexdigest()))
         for parent in dict.fromkeys(args.parent):
             links.append(dict(source_id=parent, target_id=event_id, relation="precedes"))
-        if files:
+        if prepared:
             (stage / "artifacts").mkdir()
-        for role, source in files:
+        for role, source, source_sha, sanitized in prepared:
             artifact_id = uuid.uuid4().hex
-            # Include the source extension; binary files remain binary.
+            # Include the source extension; stored bytes are sanitized UTF-8.
             name = f"{event_id}_{role}_{slug(source.stem)}_{artifact_id}{source.suffix}"
             target = stage / "artifacts" / name
-            with source.open("rb") as incoming, target.open("xb") as outgoing:
-                shutil.copyfileobj(incoming, outgoing)
-            hasher = hashlib.sha256()
-            with target.open("rb") as snapshot:
-                for chunk in iter(lambda: snapshot.read(1024 * 1024), b""):
-                    hasher.update(chunk)
+            target.write_bytes(sanitized)
+            stored_sha = hashlib.sha256(sanitized).hexdigest()
             rows.append(dict(common, event_id=event_id, record_id=artifact_id,
                              role=role, source_path=str(source),
                              snapshot_path=vault_relative(
                                  destination / "artifacts" / name, vault),
-                             sha256=hasher.hexdigest()))
+                             sha256=stored_sha))
             artifacts.append(dict(record_id=artifact_id, role=role, name=name,
                                   source_path=str(source),
-                                  sha256=hasher.hexdigest()))
+                                  sha256=stored_sha,
+                                  source_sha256=source_sha))
             links.append(dict(source_id=event_id, target_id=artifact_id,
                               relation="produced" if role == "output" else "used"))
         write_csv(stage / "records.csv", RECORD_FIELDS, rows)
@@ -276,7 +338,8 @@ def record(args):
                  timezone=zone_label, title=args.title, kind=args.kind,
                  status=args.status, tool=args.tool, model=args.model,
                  version=args.version, parents=args.parent,
-                 original_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+                 source_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+                 redactions=redactions, excluded_artifacts=excluded,
                  artifacts=artifacts),
             ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         # Record the identity→folder mapping once; never silently remap later.
@@ -339,7 +402,8 @@ def main():
                      help="Canonical project identity; mapped to a stable slug folder")
     add.add_argument("--timezone", help="IANA vault-local timezone, e.g. Asia/Seoul")
     add.add_argument("--utc-offset", dest="utc_offset",
-                     help="Fixed vault-local UTC offset, e.g. +09:00 or -04:00")
+                     help="Fixed vault-local UTC offset; use = syntax, e.g. "
+                          "--utc-offset=+09:00 or --utc-offset=-04:00")
     add.add_argument("--title", required=True)
     add.add_argument("--kind", required=True, choices=["requirement", "prompt", "response", "decision",
                                                        "execution", "artifact", "validation", "feedback", "delivery", "resume"])
