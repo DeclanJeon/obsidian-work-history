@@ -463,7 +463,7 @@ class ObsidianIndexTests(unittest.TestCase):
     def test_incomplete_event_bundle_fails_index(self):
         self.record()
         broken = (self.root() / "x-project" / "2026" / "Events"
-                  / "2026-10-13" / "c" * 32)
+                  / "2026-10-13" / ("c" * 32))
         broken.mkdir(parents=True)
         (broken / "record.md").write_text("partial\n", encoding="utf-8")
         # records.csv missing → published-but-incomplete; index must fail
