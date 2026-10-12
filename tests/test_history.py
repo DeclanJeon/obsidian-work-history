@@ -113,9 +113,9 @@ class HistoryTests(unittest.TestCase):
         output = self.base / "result.md"
         first_text = "첫 번째 결과\n"
         second_text = "두 번째 결과\n"
-        output.write_text(first_text, encoding="utf-8")
+        output.write_bytes(first_text.encode("utf-8"))
         first = self.record("--output", output, "--version", "v0001")
-        output.write_text(second_text, encoding="utf-8")
+        output.write_bytes(second_text.encode("utf-8"))
         second = self.record("--output", output, "--version", "v0002",
                              "--parent", first["event_id"], "--document", self.text)
         output.unlink()
