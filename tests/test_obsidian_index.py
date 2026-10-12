@@ -1,5 +1,7 @@
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -78,9 +80,10 @@ class ObsidianIndexTests(unittest.TestCase):
             return list(csv.DictReader(stream))
 
     def write_bundle(self, slug, date, event_id, rows, links,
-                     event_json=None, year=None):
+                     event_json=None, year=None, vault=None):
         """Craft a published event bundle by hand (no record CLI)."""
-        folder = (self.root() / slug / (year or date[:4]) / "Events"
+        root = (vault or self.vault) / "Work History"
+        folder = (root / slug / (year or date[:4]) / "Events"
                   / date / event_id)
         folder.mkdir(parents=True)
         history.write_csv(folder / "records.csv", history.RECORD_FIELDS, rows)
@@ -653,6 +656,140 @@ class ObsidianIndexTests(unittest.TestCase):
         self.view(ok=False)
         self.assertFalse((self.root() / "_index" / "events.csv").exists())
         self.assertFalse(self.day_note(slug, date).exists())
+
+    # --- Review: strict exclusion metadata match ---
+
+    def test_excluded_row_requires_fully_matching_metadata(self):
+        """A blank-snapshot artifact row is only an exclusion when the
+        event.json entry matches record_id AND role AND source_path, carries
+        a nonempty reason, and the CSV sha256 is blank. Anything else fails
+        closed with zero index writes."""
+        slug = "craft-" + "m" * 10
+        date = "2026-10-13"
+        event_id = "4" * 32
+        bundle = f"Work History/{slug}/2026/Events/{date}/{event_id}"
+        digest = "a" * 64
+        source = "/tmp/doc.bin"
+        good_exclusion = {"record_id": "r1", "role": "document",
+                          "source_path": source, "sha256": digest,
+                          "reason": "binary artifact excluded"}
+        base_json = {"schema_version": 1, "project": "craft",
+                     "project_slug": slug,
+                     "recorded_at": "2026-10-13T12:00:00+00:00",
+                     "local_date": date, "timezone": "UTC", "title": "t",
+                     "kind": "execution", "status": "completed",
+                     "parents": [], "artifacts": []}
+
+        def excluded_row(**overrides):
+            return self.base_row("craft", event_id, record_id="r1",
+                                 role="document", source_path=source,
+                                 snapshot_path="", sha256="", **overrides)
+
+        variants = [
+            # name, row overrides, event.json excluded_artifacts value
+            ("missing entry", {}, []),
+            ("mismatched record_id", {},
+             [{**good_exclusion, "record_id": "other"}]),
+            ("mismatched role", {},
+             [{**good_exclusion, "role": "output"}]),
+            ("mismatched source_path", {},
+             [{**good_exclusion, "source_path": "/tmp/other.bin"}]),
+            ("missing sha256 digest", {},
+             [{k: v for k, v in good_exclusion.items()
+               if k != "sha256"}]),
+            ("empty reason", {},
+             [{**good_exclusion, "reason": ""}]),
+            ("nonblank csv sha256 on excluded row", {"sha256": digest},
+             [good_exclusion]),
+            ("exclusion metadata on a snapshotted row",
+             {"snapshot_path": f"{bundle}/artifacts/doc.bin",
+              "sha256": digest},
+             [good_exclusion]),
+            ("excluded_artifacts not a list", {}, {"record_id": "r1"}),
+            ("excluded_artifacts entry not a dict", {}, ["r1"]),
+        ]
+        for name, row_overrides, exclusions in variants:
+            with self.subTest(variant=name):
+                vault = self.base / f"vault-{name.replace(' ', '-')}"
+                vault.mkdir()
+                rows = [self.base_row("craft", event_id,
+                                      snapshot_path=f"{bundle}/original.md",
+                                      sha256="0" * 64),
+                        excluded_row(**row_overrides)]
+                links = [dict(source_id=event_id, target_id="r1",
+                              relation="used")]
+                self.write_bundle(slug, date, event_id, rows, links,
+                                  event_json={**base_json,
+                                              "event_id": event_id,
+                                              "excluded_artifacts":
+                                                  exclusions},
+                                  vault=vault)
+                error = self.run_cli(SCRIPT, "index", "--vault", vault,
+                                     ok=False)
+                self.assertIn("error", error)
+                index_dir = vault / "Work History" / "_index"
+                self.assertFalse((index_dir / "events.csv").exists())
+                self.assertFalse((index_dir / "projects.csv").exists())
+                self.assertFalse((index_dir / "projects.md").exists())
+                self.assertFalse((vault / "Work History" / slug / "2026"
+                                  / f"{date}.md").exists())
+        # Control: a fully matching exclusion still renders normally.
+        vault = self.base / "vault-control"
+        vault.mkdir()
+        rows = [self.base_row("craft", event_id,
+                              snapshot_path=f"{bundle}/original.md",
+                              sha256="0" * 64),
+                excluded_row()]
+        links = [dict(source_id=event_id, target_id="r1", relation="used")]
+        self.write_bundle(slug, date, event_id, rows, links,
+                          event_json={**base_json, "event_id": event_id,
+                                      "excluded_artifacts": [good_exclusion]},
+                          vault=vault)
+        self.run_cli(SCRIPT, "index", "--vault", vault)
+        note = (vault / "Work History" / slug / "2026" / f"{date}.md")
+        self.assertIn("excluded", note.read_text(encoding="utf-8").lower())
+
+    # --- Review: late-conflict partial-state reporting via CLI ---
+
+    def test_main_reports_partial_state_on_late_conflict(self):
+        self.record(title="first")
+        self.view()
+        second = self.record(title="second")
+        module = load_index_module()
+        events_csv = self.root() / "_index" / "events.csv"
+        original = module.atomic_write
+        calls = {"n": 0}
+
+        def racing_write(path, content, expected_sha256):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # External edit lands mid-staging on the second update —
+                # the first update is already published.
+                Path(path).write_text("raced\n", encoding="utf-8")
+            return original(path, content, expected_sha256)
+
+        stderr = io.StringIO()
+        argv = ["obsidian_index.py", "index", "--vault", str(self.vault)]
+        with mock.patch.object(module, "atomic_write", racing_write), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(stderr):
+            code = module.main()
+        self.assertEqual(code, 2)
+        report = json.loads(stderr.getvalue())
+        self.assertIn("error", report)
+        self.assertIn("conflicts", report)
+        self.assertIn("written", report)
+        self.assertEqual(len(report["written"]), 1,
+                         "first update should be reported as written")
+        self.assertEqual(len(report["conflicts"]), 1)
+        # Paths are reported vault-relative so the caller can explain
+        # exactly which notes were updated and which were refused.
+        for path in report["written"] + report["conflicts"]:
+            self.assertFalse(Path(path).is_absolute(), path)
+            self.assertTrue(str(path).startswith("Work History"), path)
+        self.assertEqual(
+            events_csv.read_text(encoding="utf-8"), "raced\n",
+            "the raced target keeps the external edit, never overwritten")
 
     # --- Incomplete bundles fail safely ---
 
