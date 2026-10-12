@@ -41,6 +41,64 @@ class HistoryTests(unittest.TestCase):
             links = list(csv.DictReader(stream))
         return rows, links
 
+    # --- New privacy/binary tests (Stage A: expected RED before Stage B) ---
+
+    def test_known_secret_text_is_redacted_everywhere(self):
+        bearer = ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0."
+                  "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c")
+        github = "ghp_" + "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6"
+        self.text.write_text(
+            f"요청: Authorization: Bearer {bearer}\ntoken={github}\n", encoding="utf-8")
+        result = self.record()
+        event_dir = Path(result["event_path"])
+        for file in event_dir.rglob("*"):
+            if file.is_file():
+                data = file.read_bytes()
+                for secret in (bearer, github):
+                    self.assertNotIn(secret.encode(), data, file)
+        stored = (event_dir / "original.md").read_bytes()
+        self.assertNotEqual(stored, self.text.read_bytes())
+        self.assertIn(b"REDACTED", stored)
+        # The published sha256 describes the stored (redacted) bytes.
+        with open(event_dir / "records.csv", encoding="utf-8-sig", newline="") as stream:
+            row = next(r for r in csv.DictReader(stream) if r["role"] == "event")
+        self.assertEqual(row["sha256"], hashlib.sha256(stored).hexdigest())
+
+    def test_secret_bearing_document_artifact_is_not_copied(self):
+        secret = "sk-" + "x" * 48
+        doc = self.base / "notes.md"
+        doc.write_text(f"API key: {secret}\n", encoding="utf-8")
+        result = self.record("--document", doc)
+        event_dir = Path(result["event_path"])
+        for file in event_dir.rglob("*"):
+            if file.is_file():
+                self.assertNotIn(secret.encode(), file.read_bytes(), file)
+
+    def test_unscanned_binary_is_excluded_not_copied(self):
+        binary = self.base / "blob.bin"
+        payload = b"\x00\x01MAGICBYTES\xff\xfe" * 4
+        binary.write_bytes(payload)
+        result = self.record("--document", binary)
+        event_dir = Path(result["event_path"])
+        digest = hashlib.sha256(payload).hexdigest()
+        # No published file contains the binary bytes or its snapshot.
+        for file in event_dir.rglob("*"):
+            if file.is_file():
+                data = file.read_bytes()
+                self.assertNotIn(b"MAGICBYTES", data, file)
+                self.assertNotEqual(hashlib.sha256(data).hexdigest(), digest, file)
+        # The exclusion is surfaced truthfully: source digest recorded from the
+        # source read, role/path kept, reason stated — never claimed as copied.
+        event = json.loads((event_dir / "event.json").read_text(encoding="utf-8"))
+        exclusions = event.get("excluded_artifacts", [])
+        self.assertTrue(any(e["source_path"] == str(binary.resolve())
+                            and e["sha256"] == digest and e["reason"]
+                            for e in exclusions), exclusions)
+        with open(event_dir / "records.csv", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertFalse(any(str(binary) in r["source_path"] and r["snapshot_path"]
+                             for r in rows))
+
     # --- Ported upstream behavior ---
 
     def test_versions_preserve_original_bytes_and_relations(self):
@@ -212,7 +270,7 @@ class HistoryTests(unittest.TestCase):
         result = self.cli("record", "--vault", self.vault, "--project", "p",
                           "--title", "boundary2", "--kind", "requirement",
                           "--status", "received", "--text-file", self.text,
-                          "--utc-offset", "-04:00", env=env)
+                          "--utc-offset=-04:00", env=env)
         self.assertEqual(result["local_date"], "2026-10-13")
         self.assertEqual(result["timezone"], "-04:00")
         # Default (unconfigured) timezone is a clearly labeled UTC date.
