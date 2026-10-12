@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "obsidian_index.py"
@@ -532,6 +533,26 @@ class ObsidianIndexTests(unittest.TestCase):
         # Our exit must not delete the replacement lock.
         self.assertTrue(lock_path.is_file())
         self.assertIn("other", lock_path.read_text(encoding="utf-8"))
+    def test_stale_dead_owner_lock_is_not_automatically_reclaimed(self):
+        self.record()
+        module = load_index_module()
+        module.LOCK_TIMEOUT_SECONDS = 0
+        lock_path = (self.root() / "_index" / module.LOCK_FILENAME)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # An ancient lock whose owner process is provably dead must STILL
+        # not be unlinked automatically: byte-compare + unlink cannot be
+        # made atomic, so a racy reaper could delete a newer owner's lock.
+        # Orphan locks require manual cleanup instead.
+        stale = json.dumps({"token": "dead-owner", "pid": 424242})
+        lock_path.write_text(stale, encoding="utf-8")
+        old = time.time() - 86400
+        os.utime(lock_path, (old, old))
+        with mock.patch.object(module, "_pid_alive", return_value=False):
+            with self.assertRaises(ValueError):
+                with module.index_lock(self.vault):
+                    pass
+        self.assertEqual(lock_path.read_text(encoding="utf-8"), stale)
+
 
     # --- Review: event path/date validation ---
 
