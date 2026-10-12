@@ -214,6 +214,7 @@ def read_bundles(vault, project_folder=None):
         except ValueError as error:
             raise ValueError(
                 f"impossible calendar date in event path: {folder}") from error
+        event_rows = [row for row in records if row.get("role") == "event"]
         if len(event_rows) != 1:
             raise ValueError(
                 f"event bundle must have exactly one event row: {folder}")
