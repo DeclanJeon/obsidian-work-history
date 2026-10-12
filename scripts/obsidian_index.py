@@ -55,7 +55,6 @@ MANAGED_END = "<!-- obsidian-work-history:managed:end -->"
 INDEX_DIRNAME = "_index"
 LOCK_FILENAME = ".index-write.lock"
 LOCK_TIMEOUT_SECONDS = 15.0
-LOCK_STALE_SECONDS = 300.0
 PROJECT_FIELDS = ["project", "slug", "event_count",
                   "first_local_date", "last_local_date"]
 WIKILINK = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]*)?\]\]")
@@ -596,12 +595,11 @@ def index_lock(vault):
     """Serialize index writers; the event scan runs while holding it.
 
     Conservative ownership: each holder writes a unique token+PID. An
-    existing lock is reclaimed ONLY when its recorded owner process is
-    demonstrably dead AND the lock is older than LOCK_STALE_SECONDS; an
-    unreadable/malformed lock or a live-owner lock is never unlinked — the
-    caller waits or fails, so cleanup stays manual rather than risking two
-    writers. Release unlinks the file only while its on-disk bytes still
-    match the token this context wrote.
+    existing lock is NEVER automatically reclaimed — compare-and-unlink
+    cannot be made atomic, so a dead-owner stale lock blocks acquisition
+    until it times out and must be removed manually after confirming no
+    owner is running. Release unlinks the file only while its on-disk
+    bytes still match the token this context wrote.
     """
     lock_path = (history.history_root(vault) / INDEX_DIRNAME / LOCK_FILENAME)
     # Validate ancestors before creating anything: never follow a symlinked
@@ -613,6 +611,7 @@ def index_lock(vault):
     mine = json.dumps({"token": token, "pid": os.getpid(),
                        "acquired": time.time()}).encode("utf-8")
     deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    holder_info = ""
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -620,27 +619,23 @@ def index_lock(vault):
             fd = None
         if fd is not None:
             break
-        try:
-            holder_bytes = lock_path.read_bytes()
-            holder = json.loads(holder_bytes.decode("utf-8"))
-            age = time.time() - lock_path.stat().st_mtime
-        except (OSError, ValueError):
-            holder, age = None, 0.0
-        holder_pid = holder.get("pid") if isinstance(holder, dict) else None
-        # Reclaim only a demonstrably dead, stale owner. A live PID is never
-        # unlinked; unreadable/malformed locks are never unlinked either.
-        if (isinstance(holder, dict) and isinstance(holder_pid, int)
-                and not _pid_alive(holder_pid) and age > LOCK_STALE_SECONDS):
-            try:
-                # Token-compare before unlink: never remove a lock that was
-                # replaced since we read it.
-                if lock_path.read_bytes() == holder_bytes:
-                    lock_path.unlink()
-                    continue
-            except OSError:
-                pass
         if time.monotonic() > deadline:
-            raise ValueError(f"index lock is held: {lock_path}")
+            raise ValueError(
+                f"index lock is held: {lock_path}{holder_info} "
+                f"(never auto-reclaimed; remove it manually only after "
+                f"confirming no owner process is running)")
+        try:
+            holder = json.loads(
+                lock_path.read_bytes().decode("utf-8"))
+            age = time.time() - lock_path.stat().st_mtime
+            pid = holder.get("pid") if isinstance(holder, dict) else None
+            state = ("owner appears dead"
+                     if isinstance(pid, int) and not _pid_alive(pid)
+                     else "owner live or unknown")
+            holder_info = (f"; recorded owner pid={pid} "
+                           f"age={age:.0f}s ({state})")
+        except (OSError, ValueError):
+            holder_info = "; lock file unreadable"
         time.sleep(0.05)
     try:
         os.write(fd, mine)
