@@ -51,7 +51,7 @@ class MigrationTests(unittest.TestCase):
     # --- CLI helpers ---
 
     def cli(self, *args, ok=None):
-        """ok=True → rc 0; ok=False → rc 2; ok=1 → rc 1 (soft findings)."""
+        self.assertTrue(SCRIPT.is_file(), "migration CLI is not implemented")
         result = subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
                                 capture_output=True, encoding="utf-8")
         if ok is True:
