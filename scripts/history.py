@@ -106,14 +106,46 @@ def project_slug(identity):
     return f"{readable}-{digest}"
 
 
+def is_link_or_junction(path):
+    """Recognize symlinks and Windows junctions without traversing them."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction and is_junction():
+        return True
+    if os.name == "nt":
+        try:
+            return bool(path.lstat().st_file_attributes & 0x400)
+        except (AttributeError, OSError):
+            return False
+    return False
+
+
+def ensure_safe_vault_path(path, vault):
+    """Reject any existing symlink/junction between vault and a write target."""
+    try:
+        relative = path.relative_to(vault)
+    except ValueError as error:
+        raise ValueError(f"path escapes vault: {path}") from error
+    current = vault
+    for part in relative.parts:
+        current = current / part
+        if is_link_or_junction(current):
+            raise ValueError(f"refusing symlinked vault path: {current}")
+
+
 def find_project_slug(history_root, identity):
-    """Reuse the folder already recorded for this exact project identity."""
+    """Reuse a recorded mapping or an unambiguous legacy work-history folder."""
     canonical = unicodedata.normalize("NFKC", identity).strip()
+    if is_link_or_junction(history_root):
+        raise ValueError(f"refusing symlinked vault path: {history_root}")
     if not history_root.exists():
         return None
     for folder in sorted(history_root.iterdir()):
+        if not folder.is_dir() or is_link_or_junction(folder):
+            continue
         marker = folder / "project.json"
-        if not (folder.is_dir() and marker.is_file()):
+        if not marker.is_file() or is_link_or_junction(marker):
             continue
         try:
             stored = json.loads(marker.read_text(encoding="utf-8"))
@@ -121,6 +153,29 @@ def find_project_slug(history_root, identity):
             continue
         if stored.get("project") == canonical or stored.get("project") == identity:
             return folder.name
+
+    # The previous Obsidian skill used the exact project display name as its
+    # folder. Adopt only that safe single-component path with its exact title.
+    candidate = history_root / canonical
+    forbidden = '<>:"/\\\\|?*'
+    if (candidate.parent != history_root or candidate.name != canonical
+            or canonical in ("", ".", "..")
+            or any(character in forbidden or ord(character) < 32
+                   for character in canonical)):
+        return None
+    if (not candidate.is_dir() or is_link_or_junction(candidate)):
+        return None
+    readme = candidate / "README.md"
+    if not readme.is_file() or is_link_or_junction(readme):
+        return None
+    try:
+        heading = next((line for line in
+                        readme.read_text(encoding="utf-8").splitlines()
+                        if line.strip()), "")
+    except (OSError, UnicodeError):
+        return None
+    if heading == f"# {canonical} — Work History":
+        return candidate.name
     return None
 
 
@@ -262,6 +317,7 @@ def record(args):
                          artifact_text.encode("utf-8")))
 
     root = history_root(vault)
+    ensure_safe_vault_path(root, vault)
     folder_name = find_project_slug(root, args.project) or project_slug(args.project)
     event_id = uuid.uuid4().hex
     recorded_at = now_utc()
@@ -269,6 +325,7 @@ def record(args):
     local_date = f"{local:%Y-%m-%d}"
     project_folder = root / folder_name
     destination = project_folder / f"{local:%Y}" / "Events" / local_date / event_id
+    ensure_safe_vault_path(destination.parent, vault)
 
     for parent in dict.fromkeys(args.parent):
         if parent not in known_event_ids(vault):
@@ -382,17 +439,18 @@ def index(args):
     if args.project and folder is None:
         raise ValueError(f"unknown project: {args.project}")
     rows, links = load_events(vault, folder)
-    stem = f"{now_utc():%H%M%S%f_%Y-%m-%d}_전체-히스토리_{uuid.uuid4().hex}"
+    snapshot_name = f"{now_utc():%Y%m%d}_{uuid.uuid4().hex[:16]}"
     target_root = vault / HISTORY_DIRNAME / "_index" / "snapshots"
+    ensure_safe_vault_path(target_root, vault)
     target_root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".pending-index-", dir=target_root))
     try:
-        write_csv(stage / (stem + "_records.csv"), RECORD_FIELDS, rows)
-        write_csv(stage / (stem + "_links.csv"), LINK_FIELDS, links)
-        destination = target_root / stem
+        write_csv(stage / "records.csv", RECORD_FIELDS, rows)
+        write_csv(stage / "links.csv", LINK_FIELDS, links)
+        destination = target_root / snapshot_name
         os.rename(stage, destination)
-        return dict(records_csv=str(destination / (stem + "_records.csv")),
-                    links_csv=str(destination / (stem + "_links.csv")),
+        return dict(records_csv=str(destination / "records.csv"),
+                    links_csv=str(destination / "links.csv"),
                     records=len(rows), links=len(links))
     finally:
         if stage.exists():

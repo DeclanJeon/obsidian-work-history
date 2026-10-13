@@ -34,8 +34,8 @@ JSON 객체: 각 **상대 이벤트 디렉터리** → 정규 프로젝트 식�
 
 ```json
 {
-  "events/054535882370_2026-10-08_히스토리 스킬 요구사항_bc3591...": "PonsLink",
-  "events/054556303621_2026-10-08_히스토리 스킬 최종 산출물_a946...": "second_brains"
+  "events/054535882370_2026-10-08_example_requirement_bc3591...": "Example Project",
+  "events/054556303621_2026-10-08_example_output_a946...": "example-repo"
 }
 ```
 
@@ -45,16 +45,18 @@ JSON 객체: 각 **상대 이벤트 디렉터리** → 정규 프로젝트 식�
 
 - **ID/링크 보존**: 소스 `event_id`, `record_id`, `links.csv` 관계(`precedes`/`used`/`produced`)를 그대로 유지한다. `used`/`produced`는 이벤트 → 이 이벤트의 record_id여야 하고 `precedes`는 이 이벤트를 한쪽 끝으로 포함해야 한다. 알 수 없는 record_id를 가리키는 링크는 그 이벤트를 실패시킨다.
 - **멱등성**: `source_key = legacy-history:sha256(source_root + rel_dir + event_id)`. 같은 `source_key`의 기존 번들은 `already_imported` 스킵. 다른 `source_key`로 같은 `event_id`가 존재하면 **충돌** — 절대 조용히 재매핑하지 않는다.
-- **경로 안전**: `snapshot_path`는 소스 루트 아래 POSIX 상대 경로여야 한다. `..`, 절대/드라이브 경로, 백슬래시, 심링크 구성요소는 거부한다.
+- **경로 안전**: 소스 `events/`와 이벤트 디렉터리, 볼트의 `Work History` 계층은 심링크/Windows junction이면 거부한다(Python 3.10+에서는 Windows reparse-point 속성도 확인). `snapshot_path`는 소스 루트 아래 POSIX 상대 경로여야 하고 `..`, 절대/드라이브 경로, 백슬래시, 연결 경로 구성요소를 거부한다. `event_id`는 단일 안전 경로 구성요소여야 한다.
+- **CSV 무결성**: 빈 헤더/중복 헤더/행의 초과 필드는 이벤트를 실패 처리한다. 중복 헤더는 `DictReader`에서 값이 덮어써질 수 있으므로 보존을 가장하지 않는다.
 - **해시 검증**: CSV의 `sha256`이 소스 스냅샷 파일의 실제 다이제스트와 다르면 그 이벤트는 손상으로 실패한다. 빈 `snapshot_path` 행은 소스 다이제스트 검증이 불가능하므로 실패한다(업스트림은 항상 스냅샷을 쓴다).
 - **날짜 경로**: `local_date`는 소스 `recorded_at`(UTC 인스턴트 보존)을 `--timezone`/`--utc-offset`으로 변환해 계산한다. 기본은 `UTC` 레이블 — 날짜 경계를 넘는 추측은 하지 않는다.
-- **미지원 필드**: `records.csv`/`links.csv`의 알 수 없는 컬럼과 행 값은 `event.json.migration.unknown_fields`에 보존한다(`schema_version` 포함). 값이 행 수보다 짧으면 나머지는 `null`로 보존된다. 보존할 수 없는 손상은 그 이벤트를 실패시킨다 — 보고만 하고 버리지 않는다.
+- **미지원 필드**: `records.csv`/`links.csv`의 알 수 없는 컬럼과 행 값은 `event.json.migration.unknown_fields`에 보존한다(`schema_version` 포함). 텍스트 값은 비밀 패턴 검사 후 알려진 값을 `[REDACTED]`로 치환하고, 원본 CSV 파일 다이제스트를 `source_files_sha256`에 보존한다. 다이제스트는 메타데이터 분석에 사용된 바로 그 CSV 바이트에서 계산한다. 값이 행 수보다 짧으면 나머지는 `null`로 보존된다. 보존할 수 없는 손상은 그 이벤트를 실패시킨다.
 
 ## 텍스트 검사와 바이너리 제외
 
-- 주석 `<stem>.md`(→ `record.md`), 원문 `<stem>_원문.md`(→ `original.md`), UTF-8 아티팩트는 `history.screen_text`로 게시 전 검사한다. 인식된 비밀 값은 `[REDACTED]`로 치환한다. **모호한 내용(BEGIN/END 불일치 등)은 그 이벤트 전체를 실패시키고 아무것도 쓰지 않는다.**
-- `records.csv`의 `sha256`은 **저장된**(치환된) 바이트 기준이다. 원본 소스 다이제스트는 `event.json.source_sha256`/`artifacts[].source_sha256`에 출처로 남는다.
-- NUL 바이트를 포함하거나 UTF-8이 아닌 아티팩트는 바이트를 복사하지 않고 Task 1/2 호환 제외 레코드로 남긴다: `records.csv` 행(빈 `snapshot_path`/`sha256`, 소스 `record_id`/`role`/`source_path` 보존) + `event.json.excluded_artifacts[]`의 `{record_id, role, source_path, sha256(소스 다이제스트), reason}` + 기존 `used`/`produced` 링크 유지. 인덱서가 불완전 출처로 렌더링한다.
+- 주석 `<stem>.md`(→ `record.md`), 원문 `<stem>_원문.md`(→ `original.md`), UTF-8 아티팩트와 CSV의 텍스트 메타데이터(`title`, `kind`, `status`, `tool`, `model`, `version`, `role`, `source_path`, 미지원 필드)는 `history.screen_text`로 게시 전 검사한다. 인식된 비밀 값은 `[REDACTED]`로 치환한다. 출력 보고서도 알려진 비밀을 가린다.
+- 이벤트/레코드 ID와 링크 ID는 관계 보존을 위해 바꾸지 않는다. 이 값에 비밀 패턴이 있으면 이벤트를 실패 처리한다. `event_id`는 단일 안전 경로 구성요소여야 한다. **모호한 텍스트(BEGIN/END 불일치 등)는 이벤트 전체를 실패시키고 아무것도 게시하지 않는다.**
+- `records.csv`의 `sha256`은 **저장된**(치환된) 바이트 기준이다. 원본 이벤트 스냅샷/아티팩트 다이제스트는 `event.json.source_sha256`/`artifacts[].source_sha256`에, 원본 records/links CSV 다이제스트는 `event.json.migration.source_files_sha256`에 출처로 남긴다.
+- NUL 바이트를 포함하거나 UTF-8이 아닌 아티팩트는 바이트를 복사하지 않고 Task 1/2 호환 제외 레코드로 남긴다: `records.csv` 행(빈 `snapshot_path`/`sha256`, 소스 `record_id`와 검사된 `role`/`source_path` 보존) + `event.json.excluded_artifacts[]`의 `{record_id, role, source_path, sha256(소스 다이제스트), reason}` + 기존 `used`/`produced` 링크 유지. 텍스트 아티팩트 파일명은 검사 후 레코드 ID 기반의 안전한 이름으로 저장한다. 인덱서가 불완전 출처로 렌더링한다.
 
 ## 게시 원자성과 볼트 쓰기
 

@@ -172,13 +172,61 @@ class MigrationTests(unittest.TestCase):
     # --- inspect classification ---
 
     def test_inspect_classifies_global_event_store(self):
-        before = self.tree_digest(self.source)
         self.add_event("120000000001_2026-10-01_alpha_aaaa",
                        "aaaa", "2026-10-01T12:00:00.000001+00:00")
+        before = self.tree_digest(self.source)
         result = self.inspect()
         self.assertEqual(result["classification"], "global_event_store")
         self.assertEqual(result["events"], 1)
         self.assertEqual(self.tree_digest(self.source), before)
+
+    def test_inspect_rejects_symlinked_events_root(self):
+        target = self.base / "outside-events"
+        target.mkdir()
+        (target / "sensitive").mkdir()
+        events = self.source / "events"
+        events.rmdir()
+        try:
+            events.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+
+        result = self.inspect()
+        self.assertEqual(result["classification"], "unrecognized")
+        self.write_map({})
+        outcome = self.cli("dry-run", self.source, "--vault", self.vault,
+                           "--map", self.map_file, ok=False)
+        self.assertIn("error", outcome)
+        self.assertFalse((self.vault / "Work History").exists())
+
+    def test_windows_reparse_point_is_detected_without_is_junction(self):
+        migrate = load_migrate_module()
+
+        class LegacyWindowsPath:
+            def is_symlink(self):
+                return False
+
+            def lstat(self):
+                return type("Stat", (), {"st_file_attributes": 0x400})()
+
+        with mock.patch.object(migrate.os, "name", "nt"):
+            self.assertTrue(
+                migrate.is_link_or_junction(LegacyWindowsPath()))
+
+    def test_inspect_reports_symlinked_event_folder_as_corrupt(self):
+        stem = "120000000027_2026-10-01_ab_zzzz"
+        event = self.add_event(stem, "zzzz",
+                               "2026-10-01T12:00:00.000027+00:00")
+        outside = self.base / "outside-event"
+        event.rename(outside)
+        try:
+            event.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+
+        result = self.inspect()
+        self.assertEqual(result["classification"], "global_event_store")
+        self.assertIn(f"events/{stem}", result["corrupt"])
 
     def test_inspect_classifies_project_local_continuity(self):
         local = self.base / "proj" / ".history"
@@ -461,6 +509,31 @@ class MigrationTests(unittest.TestCase):
             capture_output=True, encoding="utf-8")
         self.assertEqual(view.returncode, 0, view.stderr)
 
+    def test_import_keeps_csv_hashes_for_analyzed_bytes(self):
+        stem = "120000000032_2026-10-01_ag_ffff"
+        folder = self.add_event(
+            stem, "ffff", "2026-10-01T12:00:00.000032+00:00")
+        migrate = load_migrate_module()
+        event = migrate.analyze_event(
+            self.source, f"events/{stem}", folder)
+        expected = {
+            "records": sha256(event["records_path"].read_bytes()),
+            "links": sha256(event["links_path"].read_bytes()),
+        }
+        event["records_path"].write_bytes(
+            event["records_path"].read_bytes() + b"\n")
+        event["links_path"].write_bytes(
+            event["links_path"].read_bytes() + b"\n")
+        event["source_files_safe"] = {
+            "records": event["records_path"].name,
+            "links": event["links_path"].name,
+        }
+        metadata = migrate.build_event_json(
+            event, {"source_key": "source", "project": "P"},
+            "P", "UTC", "2026-10-01", "", [], [], 0, [])
+
+        self.assertEqual(
+            metadata["migration"]["source_files_sha256"], expected)
     def test_import_preserves_unknown_fields_in_migration_metadata(self):
         stem = "120000000017_2026-10-01_ro_pppp"
         self.add_event(stem, "pppp", "2026-10-01T12:00:00.000017+00:00",
@@ -544,6 +617,149 @@ class MigrationTests(unittest.TestCase):
         self.assertFalse(list(root.glob(f"*/*/Events/*/wwww")))
         self.assertFalse(list(root.rglob(".pending-*")))
 
+    def test_import_rejects_event_id_path_traversal(self):
+        event_id = "../../../../../../escaped"
+        stem = "120000000025_2026-10-01_zi_xxxx"
+        self.add_event(stem, event_id,
+                       "2026-10-01T12:00:00.000025+00:00")
+        self.write_map({f"events/{stem}": "P"})
+        result = self.migrate_import(ok=1)
+        self.assertEqual(result["imported"], 0)
+        self.assertEqual(result["events"][0]["status"], "failed")
+        self.assertFalse((self.base / "escaped").exists())
+        self.assertFalse((self.vault / "Work History").exists())
+
+    def test_csv_metadata_and_unknown_fields_are_screened(self):
+        secret = "ghp_" + "c" * 40
+        stem = "120000000026_2026-10-01_aa_yyyy"
+        self.add_event(
+            stem, "yyyy", "2026-10-01T12:00:00.000026+00:00",
+            title=f"token {secret}",
+            artifacts=[("output", f"evt_output_{secret}_abc123.md",
+                        b"safe artifact\n", f"/tmp/{secret}/artifact.md")],
+            extra_fields={"custom_col": [secret]})
+        records = self.source / "events" / stem / f"{stem}_records.csv"
+        fields = list(UPSTREAM_FIELDS) + ["custom_col"]
+        rows = self.read_csv(records)
+        rows[0]["source_path"] = f"/tmp/{secret}/input.md"
+        self.write_csv(records, fields, rows)
+        self.write_map({f"events/{stem}": "P"})
+
+        preview = self.dry_run(ok=1)
+        self.assertTrue(preview["events"][0]["secret_flag"])
+        self.assertNotIn(secret, json.dumps(preview))
+
+        result = self.migrate_import()
+        self.assertEqual(result["imported"], 1)
+        bundle = self.bundle_dir("yyyy")
+        stored = b"".join(
+            path.relative_to(bundle).as_posix().encode() + b"\0"
+            + path.read_bytes()
+            for path in bundle.rglob("*") if path.is_file())
+        self.assertNotIn(secret.encode(), stored)
+        self.assertIn(b"[REDACTED]", stored)
+
+    def test_import_refuses_symlinked_vault_project_folder(self):
+        stem = "120000000029_2026-10-01_ad_cccc"
+        self.add_event(stem, "cccc",
+                       "2026-10-01T12:00:00.000029+00:00")
+        history_root = self.vault / "Work History"
+        history_root.mkdir()
+        external = self.base / "outside-vault-project"
+        external.mkdir()
+        project = history_root / history.project_slug("P")
+        try:
+            project.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+        before = self.tree_digest(external)
+        self.write_map({f"events/{stem}": "P"})
+
+        outcome = self.migrate_import(ok=False)
+        self.assertIn("error", outcome)
+        self.assertEqual(self.tree_digest(external), before)
+        self.assertFalse((external / "2026").exists())
+
+    def test_import_artifacts_with_duplicate_basenames_remain_distinct(self):
+        stem = "120000000028_2026-10-01_ac_bbbb"
+        folder = self.add_event(
+            stem, "bbbb", "2026-10-01T12:00:00.000028+00:00",
+            artifacts=[("input", "evt_input_first_a1.txt", b"first\n",
+                        "/tmp/first/same.txt"),
+                       ("input", "evt_input_second_a2.txt", b"second\n",
+                        "/tmp/second/same.txt")])
+        artifact_dir = folder / "artifacts"
+        for source_name, directory in (("evt_input_first_a1.txt", "first"),
+                                       ("evt_input_second_a2.txt", "second")):
+            target = artifact_dir / directory
+            target.mkdir()
+            (artifact_dir / source_name).rename(target / "same.txt")
+        records = folder / f"{stem}_records.csv"
+        rows = self.read_csv(records)
+        for row in rows:
+            if row["record_id"] == "a1":
+                row["snapshot_path"] = f"events/{stem}/artifacts/first/same.txt"
+            elif row["record_id"] == "a2":
+                row["snapshot_path"] = f"events/{stem}/artifacts/second/same.txt"
+        self.write_csv(records, UPSTREAM_FIELDS, rows)
+        self.write_map({f"events/{stem}": "P"})
+
+        result = self.migrate_import()
+        self.assertEqual(result["imported"], 1)
+        bundle = self.bundle_dir("bbbb")
+        artifact_rows = [row for row in self.read_csv(bundle / "records.csv")
+                         if row["role"] == "input"]
+        self.assertEqual(len(artifact_rows), 2)
+        self.assertEqual(len({row["snapshot_path"] for row in artifact_rows}), 2)
+        for row in artifact_rows:
+            stored_path = self.vault / row["snapshot_path"]
+            self.assertEqual(sha256(stored_path.read_bytes()), row["sha256"])
+
+
+
+
+    def test_duplicate_csv_headers_fail_closed(self):
+        stem = "120000000030_2026-10-01_ae_dddd"
+        self.add_event(stem, "dddd",
+                       "2026-10-01T12:00:00.000030+00:00")
+        records = self.source / "events" / stem / f"{stem}_records.csv"
+        rows = self.read_csv(records)
+        fields = list(UPSTREAM_FIELDS) + ["custom_col", "custom_col"]
+        with records.open("w", encoding="utf-8-sig", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(fields)
+            for row in rows:
+                writer.writerow([row.get(field, "") for field in UPSTREAM_FIELDS]
+                                + ["first", "second"])
+        self.write_map({f"events/{stem}": "P"})
+
+        result = self.migrate_import(ok=1)
+        self.assertEqual(result["imported"], 0)
+        self.assertEqual(result["events"][0]["status"], "failed")
+        self.assertFalse((self.vault / "Work History").exists())
+
+    def test_import_staging_failure_removes_created_vault_directories(self):
+        stem = "120000000031_2026-10-01_af_eeee"
+        self.add_event(stem, "eeee",
+                       "2026-10-01T12:00:00.000031+00:00")
+        self.write_map({f"events/{stem}": "P"})
+        migration = load_migrate_module()
+        analysis = migration.analyze_source(self.source)
+        mapping = migration.load_map(self.map_file)
+        entries, _, _, _ = migration.collision_check(
+            analysis, mapping, self.vault)
+        zone, zone_label = history.local_zone(
+            mock.Mock(timezone=None, utc_offset=None))
+
+        with mock.patch.object(
+                migration.history, "write_csv",
+                side_effect=OSError("injected stage failure")):
+            with self.assertRaises(OSError):
+                migration.import_event(
+                    analysis, analysis["items"][0]["event"], entries[0],
+                    self.vault, zone, zone_label)
+
+        self.assertFalse((self.vault / "Work History").exists())
 
 if __name__ == "__main__":
     unittest.main()

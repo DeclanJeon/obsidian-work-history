@@ -30,6 +30,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -56,6 +57,21 @@ class EventProblem(Exception):
 # ---------- source layout ----------
 
 
+def is_link_or_junction(path):
+    """Recognize symlinks and Windows junctions without traversing them."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction and is_junction():
+        return True
+    if os.name == "nt":
+        try:
+            return bool(path.lstat().st_file_attributes & 0x400)
+        except (AttributeError, OSError):
+            return False
+    return False
+
+
 def classify_source(path):
     """Classify a legacy store without modifying it.
 
@@ -72,11 +88,15 @@ def classify_source(path):
     events = path / "events"
     has_local_markers = ((path / "STATUS_SNAPSHOT.md").is_file()
                          or (path / "prompts").is_dir())
+    if is_link_or_junction(events):
+        return "unrecognized"
     if events.is_dir():
         entries = list(events.iterdir())
-        has_bundle_dirs = any(e.is_dir() and not e.name.startswith(".")
+        has_bundle_dirs = any(e.is_dir() and not is_link_or_junction(e)
+                              and not e.name.startswith(".")
                               for e in entries)
-        has_notes = any(e.is_file() and e.suffix == ".md" for e in entries)
+        has_notes = any(e.is_file() and not is_link_or_junction(e)
+                        and e.suffix == ".md" for e in entries)
         if has_bundle_dirs and not has_notes and not has_local_markers:
             return "global_event_store"
         if has_notes or has_local_markers:
@@ -104,10 +124,19 @@ def scan_source(root):
     for entry in sorted(root.iterdir()):
         if entry.is_dir() and entry.name.startswith(".pending-"):
             pending.append(entry.relative_to(root).as_posix())
+    if is_link_or_junction(events_root):
+        corrupt["events"] = "symlinked events directory rejected"
+        return events, pending, corrupt, non_event
     if not events_root.is_dir():
         return events, pending, corrupt, non_event
     for entry in sorted(events_root.iterdir()):
         rel = entry.relative_to(root).as_posix()
+        if is_link_or_junction(entry):
+            if entry.name.startswith(".pending-"):
+                pending.append(rel)
+            else:
+                corrupt[rel] = "symlinked event entry rejected"
+            continue
         if not entry.is_dir():
             non_event.append(rel)
             continue
@@ -153,7 +182,7 @@ def resolve_source_snapshot(root, snapshot_path):
     current = root
     for part in pure.parts:
         current = current / part
-        if current.is_symlink():
+        if is_link_or_junction(current):
             raise EventProblem(f"refusing symlinked source path: {current}")
     if not candidate.is_file():
         raise EventProblem(f"snapshot file missing: {snapshot_path!r}")
@@ -170,18 +199,114 @@ def secret_report(text):
     return hits, begins != blocks
 
 
-def read_csv_strict(path, rel):
-    """Parse one source CSV. Raises EventProblem on unreadable/short rows."""
+def screen_metadata_text(value, label):
+    """Redact supported metadata text without leaking scanner diagnostics."""
     try:
-        with path.open(encoding="utf-8-sig", newline="") as stream:
-            reader = csv.DictReader(stream)
-            rows = list(reader)
-            fields = reader.fieldnames or []
+        return history.screen_text(value, label)
+    except ValueError as error:
+        raise EventProblem(
+            f"ambiguous secret-like metadata in {label}; event blocked") from error
+
+
+def require_clean_identifier(value, label):
+    cleaned, _count = screen_metadata_text(value, label)
+    if cleaned != value:
+        raise EventProblem(
+            f"secret-like content in structural field {label}; "
+            "cannot redact without changing IDs")
+
+
+def validate_event_id(event_id):
+    """Reject IDs that cannot safely occupy exactly one destination component."""
+    forbidden = '<>:"|?*'
+    component = event_id.strip(" .")
+    device_name = component.split(".", 1)[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    is_device_number = bool(re.fullmatch(r"(?:COM|LPT)[1-9]", device_name))
+    if (not event_id or event_id in (".", "..")
+            or "/" in event_id or "\\" in event_id
+            or DRIVE_FORMAT.match(event_id)
+            or any(ord(char) < 32 or char in forbidden
+                   for char in event_id)
+            or component != event_id
+            or device_name in reserved or is_device_number):
+        raise EventProblem("event_id is not a safe single path component")
+
+
+def sanitize_unknown_fields(fields):
+    """Preserve unknown CSV columns and values, redacting only values."""
+    result = {}
+    redactions = 0
+    for column_key, values_key in (("columns", "values"),
+                                   ("link_columns", "link_values")):
+        columns = []
+        for column in fields[column_key]:
+            cleaned, count = screen_metadata_text(
+                column, "unknown CSV column name")
+            if cleaned != column:
+                raise EventProblem(
+                    "secret-like content in unknown CSV column name")
+            columns.append(cleaned)
+            redactions += count
+        result[column_key] = columns
+        clean_values = {}
+        for column, values in fields[values_key].items():
+            clean_column, count = screen_metadata_text(
+                column, "unknown CSV column name")
+            if clean_column != column:
+                raise EventProblem(
+                    "secret-like content in unknown CSV column name")
+            redactions += count
+            cleaned_values = []
+            for value in values:
+                if value is None:
+                    cleaned_values.append(None)
+                    continue
+                cleaned, count = screen_metadata_text(
+                    value, f"unknown CSV value in {column}")
+                cleaned_values.append(cleaned)
+                redactions += count
+            clean_values[clean_column] = cleaned_values
+        result[values_key] = clean_values
+    return result, redactions
+
+
+def scrub_report(value):
+    """Redact known secrets from every user-facing JSON string."""
+    if isinstance(value, str):
+        try:
+            return history.screen_text(value, "migration report")[0]
+        except ValueError:
+            return "[REDACTED: ambiguous secret-like content]"
+    if isinstance(value, list):
+        return [scrub_report(item) for item in value]
+    if isinstance(value, dict):
+        return {scrub_report(key): scrub_report(item)
+                for key, item in value.items()}
+    return value
+
+
+def print_json(value, *, file=None):
+    print(json.dumps(scrub_report(value), ensure_ascii=False), file=file)
+
+
+def read_csv_strict(path, rel):
+    """Parse and hash the exact source bytes used for CSV metadata."""
+    try:
+        raw = path.read_bytes()
+        stream = io.StringIO(raw.decode("utf-8-sig"), newline="")
+        reader = csv.DictReader(stream)
+        rows = list(reader)
+        fields = reader.fieldnames or []
     except (OSError, UnicodeError, csv.Error) as error:
         raise EventProblem(f"unreadable {rel}: {error}") from error
+    if not fields or any(not field for field in fields):
+        raise EventProblem(f"{rel} has an empty CSV field name")
+    if len(set(fields)) != len(fields):
+        raise EventProblem(f"{rel} has duplicate CSV field names")
     if any(None in row for row in rows):
         raise EventProblem(f"{rel} has ragged rows (extra unnamed fields)")
-    return fields, rows
+    return fields, rows, hashlib.sha256(raw).hexdigest()
 
 
 def analyze_event(root, rel, folder):
@@ -194,11 +319,11 @@ def analyze_event(root, rel, folder):
     original_path = next(folder.glob("*_원문.md"))
     for candidate in (records_path, links_path, annotated_path,
                       original_path):
-        if candidate.is_symlink():
+        if is_link_or_junction(candidate):
             raise EventProblem(f"refusing symlinked file: {candidate}")
 
-    fields, rows = read_csv_strict(records_path, "records.csv")
-    link_fields, links = read_csv_strict(links_path, "links.csv")
+    fields, rows, records_digest = read_csv_strict(records_path, "records.csv")
+    link_fields, links, links_digest = read_csv_strict(links_path, "links.csv")
     missing = REQUIRED_FIELDS - set(fields)
     if missing:
         raise EventProblem(f"records.csv missing fields: {sorted(missing)}")
@@ -216,6 +341,7 @@ def analyze_event(root, rel, folder):
     event_id = event_rows[0].get("event_id") or ""
     if not event_id:
         raise EventProblem("event row has empty event_id")
+    validate_event_id(event_id)
     for row in rows:
         if row.get("event_id") != event_id:
             raise EventProblem(
@@ -223,6 +349,8 @@ def analyze_event(root, rel, folder):
                 f"{row.get('event_id')!r} disagrees with {event_id!r}")
         if not row.get("record_id"):
             raise EventProblem(f"row in {rel} has empty record_id")
+        require_clean_identifier(row["record_id"], "record_id")
+        require_clean_identifier(row["event_id"], "event_id")
     record_ids = {r["record_id"] for r in rows}
     if len(record_ids) != len(rows):
         raise EventProblem(f"duplicate record_id values in {rel}")
@@ -249,6 +377,7 @@ def analyze_event(root, rel, folder):
         for key in ("source_id", "target_id", "relation"):
             if not (link.get(key) or ""):
                 raise EventProblem(f"links.csv row has empty {key}")
+            require_clean_identifier(link[key], f"links.csv {key}")
         source_id, target_id = link["source_id"], link["target_id"]
         relation = link["relation"]
         if relation in ("used", "produced"):
@@ -266,6 +395,24 @@ def analyze_event(root, rel, folder):
 
     secret_hits = 0
     ambiguous = False
+    for value in (rel, *(path.name for path in
+                        (records_path, links_path, annotated_path,
+                         original_path)), *fields, *link_fields):
+        hits, bad = secret_report(value)
+        secret_hits += hits
+        ambiguous = ambiguous or bad
+    for row in rows:
+        for value in row.values():
+            if value:
+                hits, bad = secret_report(value)
+                secret_hits += hits
+                ambiguous = ambiguous or bad
+    for link in links:
+        for value in link.values():
+            if value:
+                hits, bad = secret_report(value)
+                secret_hits += hits
+                ambiguous = ambiguous or bad
     for text_path, label in ((annotated_path, stem + ".md"),
                              (original_path, stem + "_원문.md")):
         data = text_path.read_bytes()
@@ -333,6 +480,7 @@ def analyze_event(root, rel, folder):
         rel=rel, folder=folder, event_id=event_id, rows=rows, links=links,
         event_row=event_rows[0], recorded_at=recorded_at,
         records_path=records_path, links_path=links_path,
+        source_files_sha256=dict(records=records_digest, links=links_digest),
         annotated_path=annotated_path, original_path=original_path,
         unknown_fields=dict(columns=unknown_record_cols,
                             values=unknown_values,
@@ -376,6 +524,16 @@ def load_map(map_path):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"project map value for {key!r} must be a "
                              f"non-empty project identity string")
+        try:
+            clean_value, _count = history.screen_text(
+                value, "project identity")
+        except ValueError as error:
+            raise ValueError(
+                "project identity has ambiguous secret-like content") from error
+        if clean_value != value:
+            raise ValueError(
+                "project identity contains secret-like content; choose a "
+                "non-secret canonical name")
         mapping[pure.as_posix()] = value
     return mapping
 
@@ -383,8 +541,62 @@ def load_map(map_path):
 # ---------- vault side ----------
 
 
+def assert_safe_history_tree(vault):
+    """Refuse vault history paths that would traverse symlinks or junctions."""
+    root = history.history_root(vault)
+    if is_link_or_junction(root):
+        raise ValueError("Work History root must not be a symlink or junction")
+    if not root.exists():
+        return
+    if not root.is_dir():
+        raise ValueError("Work History path exists but is not a directory")
+    for project in root.iterdir():
+        if is_link_or_junction(project):
+            raise ValueError(f"symlinked Work History entry rejected: {project.name}")
+        marker = project / "project.json"
+        if is_link_or_junction(marker):
+            raise ValueError("symlinked project.json marker rejected")
+        if not project.is_dir():
+            continue
+        for year in project.iterdir():
+            if is_link_or_junction(year):
+                raise ValueError(f"symlinked project entry rejected: {year.name}")
+            if not year.is_dir():
+                continue
+            events = year / "Events"
+            if is_link_or_junction(events):
+                raise ValueError("symlinked Events directory rejected")
+            if not events.is_dir():
+                continue
+            for day in events.iterdir():
+                if is_link_or_junction(day):
+                    raise ValueError(f"symlinked event day rejected: {day.name}")
+                if not day.is_dir():
+                    continue
+                for event in day.iterdir():
+                    if is_link_or_junction(event):
+                        raise ValueError(
+                            f"symlinked event bundle rejected: {event.name}")
+                    if not event.is_dir():
+                        continue
+                    for name in ("event.json", "records.csv", "links.csv",
+                                 "record.md", "original.md"):
+                        if is_link_or_junction(event / name):
+                            raise ValueError(
+                                f"symlinked event file rejected: {name}")
+                    artifacts = event / "artifacts"
+                    if is_link_or_junction(artifacts):
+                        raise ValueError("symlinked artifacts directory rejected")
+                    if artifacts.is_dir():
+                        for artifact in artifacts.iterdir():
+                            if is_link_or_junction(artifact):
+                                raise ValueError(
+                                    "symlinked artifact file rejected")
+
+
 def vault_event_index(vault):
     """{event_id: (bundle_dir, source_key_or_None)} for published bundles."""
+    assert_safe_history_tree(vault)
     found = {}
     root = history.history_root(vault)
     if not root.exists():
@@ -399,6 +611,8 @@ def vault_event_index(vault):
                     json_path.read_text(encoding="utf-8")).get("source_key")
             except (OSError, ValueError):
                 key = None
+        if event_id in found:
+            raise ValueError(f"duplicate event_id in vault history: {event_id}")
         found[event_id] = (folder, key)
     return found
 
@@ -546,7 +760,7 @@ def cmd_dry_run(args):
     soft = (unmapped or orphan or analysis["corrupt"] or collisions
             or any(e.get("secret_flag") or e.get("ambiguous")
                    or e.get("excluded_artifacts") for e in entries))
-    print(json.dumps(result, ensure_ascii=False))
+    print_json(result)
     return 1 if soft else 0
 
 
@@ -571,19 +785,14 @@ def build_event_json(event, entry, folder_name, zone_label, local_date,
                 migration=dict(
                     schema_version=MIGRATION_SCHEMA_VERSION,
                     source_event_dir=event["rel"],
-                    source_files=dict(
-                        records=event["records_path"].name,
-                        links=event["links_path"].name,
-                        annotated=event["annotated_path"].name,
-                        original=event["original_path"].name),
-                    original_recorded_at=record["recorded_at"],
+                    source_files=event["source_files_safe"],
+                    source_files_sha256=event["source_files_sha256"],
                     unknown_fields=event["unknown_fields"],
                     imported_at=datetime.now(timezone.utc).isoformat()))
 
 
 def import_event(analysis, event, entry, vault, zone, zone_label):
     """Stage and atomically publish one migrated event bundle."""
-    root = analysis["root"]
     record = event["event_row"]
     parents = [l["source_id"] for l in event["links"]
                if l["relation"] == "precedes"
@@ -592,12 +801,19 @@ def import_event(analysis, event, entry, vault, zone, zone_label):
     local = recorded.astimezone(zone)
     local_date = f"{local:%Y-%m-%d}"
     year = f"{local:%Y}"
+    assert_safe_history_tree(vault)
     folder_name = (history.find_project_slug(history.history_root(vault),
                                              entry["project"])
                    or history.project_slug(entry["project"]))
     project_folder = history.history_root(vault) / folder_name
     destination = (project_folder / year / "Events" / local_date
                    / event["event_id"])
+    history_root = history.history_root(vault)
+    for candidate in (history_root, project_folder,
+                      project_folder / year, project_folder / year / "Events",
+                      destination.parent, destination):
+        if is_link_or_junction(candidate):
+            raise EventProblem("refusing symlinked or junctioned vault path")
     if destination.exists():
         raise EventProblem(f"destination already exists: {destination}")
 
@@ -608,17 +824,52 @@ def import_event(analysis, event, entry, vault, zone, zone_label):
     excluded = []
     original_data = event["original_path"].read_bytes()
     original_text = original_data.decode("utf-8-sig")
-    clean_text, count = history.screen_text(original_text,
-                                            event["original_path"])
+    clean_text, count = screen_metadata_text(
+        original_text, event["original_path"].name)
     redactions += count
     stored_original = clean_text.encode("utf-8")
     stored_original_sha = hashlib.sha256(stored_original).hexdigest()
 
     annotated_data = event["annotated_path"].read_bytes()
     annotated_text = annotated_data.decode("utf-8-sig")
-    clean_annotated, count = history.screen_text(annotated_text,
-                                                 event["annotated_path"])
+    clean_annotated, count = screen_metadata_text(
+        annotated_text, event["annotated_path"].name)
     redactions += count
+
+    screened_rows = {}
+    for row in event["rows"]:
+        screened = dict(row)
+        for field in ("title", "kind", "status", "tool", "model",
+                      "version", "role", "source_path"):
+            cleaned, count = screen_metadata_text(
+                row.get(field) or "", f"record {row['record_id']} {field}")
+            screened[field] = cleaned
+            redactions += count
+        screened_rows[row["record_id"]] = screened
+    unknown_fields, count = sanitize_unknown_fields(event["unknown_fields"])
+    redactions += count
+
+    safe_rel, count = screen_metadata_text(
+        event["rel"], "source event directory")
+    redactions += count
+    safe_source_files = {}
+    for field, source_path in (
+            ("records", event["records_path"]),
+            ("links", event["links_path"]),
+            ("annotated", event["annotated_path"]),
+            ("original", event["original_path"])):
+        safe_name, count = screen_metadata_text(
+            source_path.name, f"source {field} filename")
+        safe_source_files[field] = safe_name
+        redactions += count
+
+    safe_event = dict(event)
+    safe_event.update(
+        event_row=screened_rows[event["event_id"]],
+        rows=[screened_rows[row["record_id"]] for row in event["rows"]],
+        unknown_fields=unknown_fields,
+        rel=safe_rel,
+        source_files_safe=safe_source_files)
 
     snapshot_by_record = {row["record_id"]: (row, path, digest)
                           for row, path, digest in event["snapshots"]}
@@ -627,7 +878,7 @@ def import_event(analysis, event, entry, vault, zone, zone_label):
     common = dict(schema_version=str(history.SCHEMA_VERSION),
                   project=entry["project"], source_key=entry["source_key"],
                   local_date=local_date, timezone=zone_label)
-    for row in event["rows"]:
+    for index, row in enumerate(safe_event["rows"], start=1):
         new_row = {field: row.get(field) or "" for field in UPSTREAM_FIELDS}
         new_row.update(common)
         if row.get("role") == "event":
@@ -643,10 +894,19 @@ def import_event(analysis, event, entry, vault, zone, zone_label):
             _row, source_file, _digest = snapshot_by_record[row["record_id"]]
             data = source_file.read_bytes()
             text = data.decode("utf-8-sig")
-            clean, count = history.screen_text(text, source_file)
+            clean, count = screen_metadata_text(text, source_file.name)
             redactions += count
             stored = clean.encode("utf-8")
-            name = source_file.name
+            safe_name, count = screen_metadata_text(
+                source_file.name, "artifact filename")
+            redactions += count
+            stem = history.slug(Path(safe_name).stem)
+            suffix = Path(safe_name).suffix
+            if not re.fullmatch(r"\.[A-Za-z0-9]{1,16}", suffix):
+                suffix = ""
+            record_hash = hashlib.sha256(
+                row["record_id"].encode("utf-8")).hexdigest()
+            name = f"{index:04d}-{record_hash}-{stem}{suffix}"
             new_row["snapshot_path"] = history.vault_relative(
                 destination / "artifacts" / name, vault)
             new_row["sha256"] = hashlib.sha256(stored).hexdigest()
@@ -658,16 +918,28 @@ def import_event(analysis, event, entry, vault, zone, zone_label):
                 source_sha256=row.get("sha256") or ""))
         rows.append(new_row)
     for item in event["excluded_artifacts"]:
-        excluded.append(dict(record_id=item["record_id"], role=item["role"],
-                             source_path=item["source_path"],
+        row = screened_rows[item["record_id"]]
+        excluded.append(dict(record_id=item["record_id"],
+                             role=row.get("role") or "",
+                             source_path=row.get("source_path") or "",
                              sha256=item["sha256"], reason=item["reason"]))
     links = [dict(source_id=l["source_id"], target_id=l["target_id"],
                   relation=l["relation"]) for l in event["links"]]
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=".pending-",
-                                  dir=destination.parent))
+    missing_parents = []
+    current = destination.parent
+    while current != vault and not current.exists():
+        missing_parents.append(current)
+        current = current.parent
+    stage = None
+    renamed = False
+    published = False
+    marker = project_folder / "project.json"
+    marker_created = False
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=".pending-",
+                                      dir=destination.parent))
         (stage / "record.md").write_bytes(clean_annotated.encode("utf-8"))
         (stage / "original.md").write_bytes(stored_original)
         if prepared:
@@ -677,22 +949,53 @@ def import_event(analysis, event, entry, vault, zone, zone_label):
         history.write_csv(stage / "records.csv", history.RECORD_FIELDS, rows)
         history.write_csv(stage / "links.csv", history.LINK_FIELDS, links)
         (stage / "event.json").write_text(json.dumps(
-            build_event_json(event, entry, folder_name, zone_label,
+            build_event_json(safe_event, entry, folder_name, zone_label,
                              local_date, stored_original_sha,
                              stored_artifacts, excluded, redactions,
                              parents),
             ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.rename(stage, destination)
-        marker = project_folder / "project.json"
+        stage = None
+        renamed = True
         if not marker.exists():
-            marker.write_text(json.dumps(
-                dict(schema_version=history.SCHEMA_VERSION,
-                     project=entry["project"], slug=folder_name),
-                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            try:
+                with marker.open("x", encoding="utf-8") as stream:
+                    marker_created = True
+                    stream.write(json.dumps(
+                        dict(schema_version=history.SCHEMA_VERSION,
+                             project=entry["project"], slug=folder_name),
+                        ensure_ascii=False, indent=2) + "\n")
+            except FileExistsError:
+                existing = json.loads(marker.read_text(encoding="utf-8"))
+                if existing.get("project") != entry["project"]:
+                    raise EventProblem(
+                        "project marker changed during publication")
+        else:
+            try:
+                existing = json.loads(
+                    marker.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise EventProblem(
+                    "existing project marker cannot be verified") from error
+            if existing.get("project") != entry["project"]:
+                raise EventProblem(
+                    "existing project marker conflicts with the mapping")
+        published = True
         return dict(status="imported", destination=str(destination))
     finally:
-        if stage.exists():
+        if stage is not None and stage.exists():
             shutil.rmtree(stage)
+        if not published:
+            if marker_created and marker.exists():
+                marker.unlink()
+            if renamed and destination.exists():
+                shutil.rmtree(destination)
+            for parent in missing_parents:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
+
 
 
 def cmd_import(args):
@@ -742,7 +1045,7 @@ def cmd_import(args):
                   events=results, unmapped=unmapped,
                   corrupt=analysis["corrupt"], pending=analysis["pending"],
                   collisions=collisions)
-    print(json.dumps(result, ensure_ascii=False))
+    print_json(result)
     return 1 if (failed or unmapped or collisions
                  or analysis["corrupt"]) else 0
 
@@ -796,14 +1099,13 @@ def main():
     try:
         if args.command == "inspect":
             result = cmd_inspect(args)
-            print(json.dumps(result, ensure_ascii=False))
+            print_json(result)
             return 0
         if args.command == "dry-run":
             return cmd_dry_run(args)
         return cmd_import(args)
     except (ValueError, OSError, UnicodeError, csv.Error) as error:
-        print(json.dumps({"error": str(error)}, ensure_ascii=False),
-              file=sys.stderr)
+        print_json({"error": str(error)}, file=sys.stderr)
         return 2
 
 

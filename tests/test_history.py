@@ -270,6 +270,20 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(rows[0]["local_date"], result["local_date"])
         self.assertEqual(rows[0]["timezone"], "Asia/Seoul")
 
+    def test_index_snapshot_works_with_long_vault_path(self):
+        long_vault = self.base / ("a" * 32) / ("b" * 32) / "vault"
+        long_vault.mkdir(parents=True)
+        self.cli("record", "--vault", long_vault, "--project", "Long Path Project",
+                 "--title", "Long path snapshot", "--kind", "requirement",
+                 "--status", "received", "--text-file", self.text)
+        result = self.cli("index", "--vault", long_vault)
+        self.assertLess(len(result["records_csv"]), 260)
+        self.assertEqual(Path(result["records_csv"]).name, "records.csv")
+        self.assertTrue(Path(result["records_csv"]).is_file(), result["records_csv"])
+        self.assertTrue(Path(result["links_csv"]).is_file())
+        self.assertEqual(Path(result["links_csv"]).name, "links.csv")
+
+
     def test_project_slug_is_stable_and_collision_resistant(self):
         first = self.record("--project", "My Project!")
         second = self.record("--project", "My Project?")
@@ -278,6 +292,75 @@ class HistoryTests(unittest.TestCase):
         self.assertNotEqual(slug_a, slug_b)
         again = self.record("--project", "My Project!")
         self.assertEqual(Path(again["event_path"]).relative_to(self.vault).parts[1], slug_a)
+
+    def test_reuses_legacy_project_folder_and_deduplicates_date_link(self):
+        vault_root = self.vault / "Work History"
+        project = vault_root / "Compatible Project"
+        year = project / "2026"
+        year.mkdir(parents=True)
+        project_note = project / "README.md"
+        project_note.write_text(
+            "# Compatible Project — Work History\n"
+            "- [[Work History/Compatible Project/2026/2026-10-13|"
+            "2026-10-13]] — earlier session\n",
+            encoding="utf-8")
+        day_note = year / "2026-10-13.md"
+        original_day = "---\ntype: work-history\ndate: 2026-10-13\n"
+        day_note.write_text(original_day + "\n## Earlier session\n",
+                            encoding="utf-8")
+        env = dict(os.environ,
+                   **{FIXED_NOW_ENV: "2026-10-13T12:00:00+00:00"})
+
+        result = self.cli(
+            "record", "--vault", self.vault, "--project", "Compatible Project",
+            "--title", "new work", "--kind", "execution",
+            "--status", "started", "--text-file", self.text, env=env)
+
+        event_path = Path(result["event_path"])
+        self.assertEqual(event_path.parents[3], project)
+        self.assertEqual((project / "project.json").is_file(), True)
+        view = subprocess.run(
+            [sys.executable, str(SCRIPT.with_name("obsidian_index.py")),
+             "index", "--vault", str(self.vault)],
+            capture_output=True, encoding="utf-8")
+        self.assertEqual(view.returncode, 0, view.stderr)
+        project_text = project_note.read_text(encoding="utf-8")
+        self.assertEqual(
+            project_text.count(
+                "[[Work History/Compatible Project/2026/2026-10-13"), 1)
+        self.assertIn("earlier session", project_text)
+        self.assertEqual(day_note.read_text(encoding="utf-8")
+                         .count("## Earlier session"), 1)
+
+    def test_record_refuses_symlinked_work_history_root(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        work_history = self.vault / "Work History"
+        try:
+            work_history.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+
+        self.record(ok=False)
+
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_index_refuses_symlinked_snapshot_root(self):
+        self.record()
+        outside = self.base / "outside-snapshots"
+        outside.mkdir()
+        snapshot_root = self.vault / "Work History" / "_index" / "snapshots"
+        snapshot_root.parent.mkdir(parents=True)
+        try:
+            snapshot_root.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+
+        result = self.cli("index", "--vault", self.vault, ok=False)
+
+        self.assertIn("refusing symlinked vault path", result["error"])
+        self.assertEqual(list(outside.iterdir()), [])
+
 
     def test_utc_midnight_boundary_uses_vault_local_date(self):
         env = dict(os.environ, **{FIXED_NOW_ENV: "2026-10-14T01:30:00+00:00"})

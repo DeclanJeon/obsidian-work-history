@@ -1,8 +1,8 @@
-# Unified Obsidian Work History — Design Proposal
+# Unified Obsidian Work History — Approved Design and QA
 
-**Status:** Proposed; awaiting user review  
-**Scope decision:** Combine only the `history-skills` and `obsidian-project-history` skill projects. Do not integrate TraceForge, Work Blackbox, LatticeMind, or other repositories.  
-**Provisional repository/skill name:** `obsidian-work-history` (check name availability before creation).
+**Status:** Approved design; consolidated implementation, 80-test suite, and five paired synthetic evaluations complete. Public publication, skill installation/cutover, and old-repository deletion remain gated by the verification steps below.
+**Scope decision:** Combine only the `history-skills` and `obsidian-project-history` skill projects. Do not integrate TraceForge, Work Blackbox, LatticeMind, or other repositories.
+**Repository/skill name:** `obsidian-work-history`.
 
 ## 1. Goal
 
@@ -50,7 +50,7 @@ Canonical readable notes:
 ```
 
 Each event bundle is the canonical immutable source record, created in a unique directory. The dated Markdown note is a generated navigation/view file that links to event bundles; it is not the sole audit source and must not silently overwrite manual content. Project slugs must be safe, stable, and collision-resistant, with the original project identity kept in metadata. Each event needs a stable unique ID, timestamp/timezone, project identity, event kind/status, source/provenance, parent event IDs, and artifact references. Preserve the existing CSV fields (`record_id`, `event_id`, `recorded_at`, `title`, `kind`, `status`, `tool`, `model`, `version`, `role`, `source_path`, `snapshot_path`, `sha256`) and links (`precedes`, `used`, `produced`) or document a lossless versioned mapping before migration. Preserve unknown source fields; never silently discard them.
-Slug rule: reuse the project folder mapping already recorded in the Vault; for a new project, normalize its canonical identity with Unicode NFKC, replace forbidden path characters, bound the readable portion, and append a fixed-length SHA-256 suffix of the canonical identity. Keep the original identity and slug together in `_index/projects.csv`; never silently remap an existing project when its display name changes.
+Slug rule: reuse the `project.json` mapping already recorded in the Vault. For compatibility with the prior Obsidian skill, adopt an unmarked exact-display-name folder only when its first non-empty README heading is exactly `# <Project> — Work History`; persist the mapping on the first successful record and preserve its existing notes. Otherwise, new projects use Unicode NFKC normalization, safe path replacement, a bounded readable portion, and a fixed-length SHA-256 suffix of the canonical identity. Keep the original identity and slug together in `_index/projects.csv`; never silently remap an existing project when its display name changes.
 
 The current upstream CLI status values are `received`, `started`, `completed`, `failed`, and `interrupted`; it has no `resumed` status. Represent a resume as a new event whose kind/transition identifies `resume`, with status `started`, `completed`, or `failed`; link it to the prior interrupted event. Do not silently extend/rename status values without a schema migration.
 New writes intentionally change the old CLI's default destination from `Path.home() / ".history"` to the resolved Obsidian vault; preserve the old CLI behavior only for explicit legacy import, not as a hidden fallback. Keep the upstream Python 3.10+ standard-library constraint unless implementation evidence requires changing it. Event `recorded_at` remains UTC; the dated Vault path uses the configured/documented vault-local timezone and records both the UTC instant and derived local date/timezone. If the vault timezone is unknown, do not guess across a date boundary; require an explicit timezone or use a clearly labeled UTC date.
@@ -128,7 +128,7 @@ The new repository contains one `SKILL.md`, the migrated CLI and versioned recor
 5. Create the new public repository, push, and verify URL/visibility/default branch/commit.
 6. Install and smoke-test the new skill; only then remove old skill registrations and perform the separately confirmed old-repository deletion. Verify deletion by querying GitHub and record exact outcomes.
 
-**Approval gate:** This document is a proposal. No implementation, public repository creation, skill removal, or GitHub deletion occurs until the user approves the reviewed design. The deletion intent is captured, but the irreversible operation still requires a final exact-target check before execution.
+**Approval gate:** The user approved this design and authorized implementation, creation/publication of the new public repository, removal of the two old skill registrations, and deletion of the two named old public repositories. Deletion remains irreversible and is gated by verified private all-ref backups, tested restoration, successful public release and cutover, and exact final owner/repository checks.
 ## 12. Design QA record
 
 QA compared this proposal with the actual `history-skills` CLI, `record-format.md`, tests, and the `obsidian-project-history` skill.
@@ -145,8 +145,12 @@ QA compared this proposal with the actual `history-skills` CLI, `record-format.m
 | Independent review: acceptance allowed an unsupported field to be dropped after merely reporting it. | Every field must be retained or the event import fails; explicit report-only loss cannot pass. |
 | Independent review: Vault-local date logic lacked a UTC-midnight boundary test. | Acceptance now requires a deterministic case where UTC and Vault-local dates differ, checking both index location and preserved UTC instant. |
 | QA: project-local `.history/` may not use the global event-bundle CSV layout. | The design separates global event-store import from project-local continuity reads; unsupported local formats are not bulk-imported without a distinct adapter and approved dry run. |
+| QA/evaluation: the old skill's human-named project folder was not recognized by the event CLI, so a new hashed folder could strand existing daily notes. | Reuse only an unambiguous exact-name legacy folder with the expected README heading, then persist `project.json`; otherwise preserve it and avoid silent remapping. A permanent CLI→indexer regression checks this compatibility and exact-target link deduplication. |
+| Review of migration code found Python 3.10+ Windows junction fallback and late source-CSV digest rereads. | Detect Windows reparse points through `lstat` when `Path.is_junction` is unavailable; hash the exact CSV bytes parsed during analysis. Added RED→GREEN tests and independent re-review. |
+| Final CLI smoke found that verbose snapshot paths exceed the Windows path limit in deep Vault locations. | Store query snapshots in a compact date/ID directory with fixed `records.csv`/`links.csv` names; add a deep-path regression and keep the returned files below the legacy Windows path limit. |
+| Independent security review found the CSV snapshot writer could follow a symlink/junction at `Work History/_index/snapshots` outside the Vault. | Check every existing vault path component with the shared symlink/junction guard before creating the snapshots directory; a regression test proves rejection and zero outside writes. |
 
-The reviewed source CLI is Python 3.10+ standard-library code; current GitHub license metadata for both source repositories is `null`. No implementation, repository creation, skill removal, or deletion has been performed during this QA.
+The reviewed source CLI is Python 3.10+ standard-library code; current GitHub license metadata for both source repositories is `null`. No `LICENSE` is included without explicit approval. Publication requires GitHub readback of URL, visibility, default branch, and commit; old-repository deletion requires private all-ref backups and restore verification.
 
 ## Implementation addendum (schema_version 1)
 

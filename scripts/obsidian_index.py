@@ -129,7 +129,7 @@ class LinkEmitter:
 
 def ensure_inside_vault(path, vault):
     """Return ``path`` only if every component below the vault is real —
-    no symlink hops, no escape."""
+    no symlink or junction hops, no escape."""
     try:
         relative = Path(path).relative_to(vault)
     except ValueError as error:
@@ -137,15 +137,15 @@ def ensure_inside_vault(path, vault):
     current = vault
     for part in relative.parts:
         current = current / part
-        if current.is_symlink():
+        if history.is_link_or_junction(current):
             raise ValueError(f"refusing symlinked path: {current}")
     return current
 
 
 def check_write_target(path, vault):
-    """Refuse symlinked/escaping/directory targets before planning a write."""
+    """Refuse symlink/junction/escaping/directory targets before writing."""
     relative = ensure_inside_vault(path, vault)
-    if relative.is_symlink():
+    if history.is_link_or_junction(relative):
         raise ValueError(f"refusing to write through symlink: {path}")
     if relative.is_dir():
         raise ValueError(f"ambiguous write target (is a directory): {path}")
@@ -183,8 +183,9 @@ def read_bundles(vault, project_folder=None):
         links_path = folder / "links.csv"
         json_path = folder / "event.json"
         for candidate in (records_path, links_path, json_path):
-            if candidate.is_symlink():
-                raise ValueError(f"refusing symlinked bundle file: {candidate}")
+            if history.is_link_or_junction(candidate):
+                raise ValueError(
+                    f"refusing symlinked bundle file: {candidate}")
         if not (records_path.is_file() and links_path.is_file()):
             raise ValueError(f"incomplete event: {folder}")
         records = read_csv_rows(records_path)
@@ -298,7 +299,7 @@ def read_bundles(vault, project_folder=None):
 def project_name(root, slug, events):
     marker = root / slug / "project.json"
     try:
-        if marker.is_file() and not marker.is_symlink():
+        if marker.is_file() and not history.is_link_or_junction(marker):
             stored = json.loads(marker.read_text(encoding="utf-8"))
             if stored.get("project"):
                 return stored["project"]

@@ -59,7 +59,7 @@ python scripts/history.py index [--vault PATH] [--project IDENTITY]
 
 ## 이벤트 메타데이터 (schema_version 1)
 
-- `project`(필수): 프로젝트의 정규 식별자. 폴더명으로는 Unicode NFKC 정규화, 경로 금지 문자 치환, 가독 부분 48자 제한, 정규 식별자 SHA-256 앞 10자리 접미사 규칙의 **slug**를 쓴다. 동일 식별자는 볼트에 기록된 매핑(`<slug>/project.json`)을 재사용하며 표시 이름이 바뀌어도 기존 매핑을 바꾸지 않는다.
+- `project`(필수): 프로젝트의 정규 식별자. 폴더명으로는 Unicode NFKC 정규화, 경로 금지 문자 치환, 가독 부분 48자 제한, 정규 식별자 SHA-256 앞 10자리 접미사 규칙의 **slug**를 쓴다. 기존 `<slug>/project.json` 매핑을 재사용하고, 이전 스킬의 표시명 폴더는 폴더명이 정규 식별자와 같고 첫 비어 있지 않은 README 제목이 `# <project> — Work History`일 때만 채택해 첫 이벤트에 매핑을 고정한다. 표시명이 바뀌어도 기존 매핑을 바꾸지 않는다.
 - `source_key`: 이벤트의 안정된 출처 키. 새 기록에서는 `event_id`와 동일하다.
 - `recorded_at`: UTC ISO 8601 기록 시각(마이크로초). 전체 시간순 정렬 기준.
 - `local_date`/`timezone`: 볼트 로컬 날짜와 그 기준 시간대. `--timezone`은 IANA 이름(예: `Asia/Seoul`), `--utc-offset`은 고정 오프셋(예: `--utc-offset=+09:00`, `--utc-offset=-04:00`)을 받는다. 둘 다 없으면 명확히 `UTC`로 표기된 UTC 날짜를 쓰며 시간대를 추측하지 않는다.
@@ -89,11 +89,12 @@ python scripts/history.py index [--vault PATH] [--project IDENTITY]
             artifacts/
               <event_id>_<role>_<원래제목>_<파일ID>.<원래확장자>
   _index/
-    snapshots/<stem>_records.csv         # index 명령의 조회용 스냅샷
-    snapshots/<stem>_links.csv
+    snapshots/<YYYYMMDD>_<snapshot-id>/
+      records.csv                     # index 명령의 조회용 스냅샷
+      links.csv
 ```
 
-이벤트는 대상 날짜 폴더 안의 `.pending-*` 임시 디렉터리에 완성한 뒤 같은 파일시스템 내 rename으로 게시한다. 게시 실패나 중단으로 남은 `.pending-*`는 미게시 기록이며 `index`에 포함되지 않고 자동 완료·삭제하지 않는다. `snapshot_path`는 볼트 루트 기준 POSIX 상대 경로다.
+- 이벤트는 대상 날짜 폴더 안의 `.pending-*` 임시 디렉터리에 완성한 뒤 같은 파일시스템 내 rename으로 게시한다. 게시 실패나 중단으로 남은 `.pending-*`는 미게시 기록이며 `index`에 포함되지 않고 자동 완료·삭제하지 않는다. `snapshot_path`는 볼트 루트 기준 POSIX 상대 경로다. 이벤트 작성과 CSV 스냅샷 `index`는 대상 경로 아래 볼트 내 기존 심링크/Windows junction 구성요소가 있으면 거부한다.
 
 `index`는 게시 완료 이벤트를 모아 `Work History/_index/snapshots/` 아래 새 CSV 스냅샷을 원자적으로 쓴다. 병렬 작업이 진행 중이면 이후 게시 이벤트는 빠질 수 있으므로 납품 직전 모든 writer가 끝난 뒤 다시 실행한다. 날짜별·프로젝트·전역 Obsidian 뷰는 `scripts/obsidian_index.py index`가 생성한다 — 레이아웃·관리 마커·링크 중복 제거·실패 안전 규칙은 [obsidian-layout.md](obsidian-layout.md)를 참고한다.
 

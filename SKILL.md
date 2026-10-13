@@ -1,64 +1,86 @@
 ---
 name: obsidian-work-history
-description: "AI 작업 히스토리와 프로젝트 작업 기록을 Obsidian 볼트에 보존할 때 사용한다. 요구사항·프롬프트 원문, 중간/최종 산출물, 버전 출처, 중단·재개 기록을 프로젝트/연도/날짜별 이벤트로 남기거나, 이전 세션 작업을 재개할 때 이 스킬을 사용한다."
-compatibility: "파일 읽기·쓰기와 명령 실행이 가능한 에이전트. 기록 도구는 Python 3.10+ 표준 라이브러리만 필요하다."
+description: "Use when recording, organizing, finding, or resuming AI project work in an Obsidian vault, including requirements, prompts, decisions, tool results, failures, validation, versioned artifacts, and delivery history."
+compatibility: "Python 3.10+ standard library for the included CLI; file and command access required."
 ---
 
 # Obsidian Work History
 
-목표는 요약 일지가 아니라 **원문과 실제 산출물의 추적 가능한 보존**이다. 기록의 정식 위치는 Obsidian 볼트의 `Work History/`이며 각 이벤트는 불변 번들로 게시된다. 기록은 감사 자료이지 품질 검증·승인·수락의 증거가 아니다.
+## Purpose and boundaries
 
-## 1. 볼트를 해석한다
+Keep one traceable project history in the Obsidian vault: immutable event bundles are the source of truth; project, year, and date notes are generated navigation. A history entry is evidence, not proof of QA, approval, or acceptance.
 
-해석 순서:
+Use this skill when the user asks to log/archive work, resume an interrupted operation, find prior work, or when a substantial project task reaches a meaningful checkpoint. Skip greetings, trivial chat, and unrelated Q&A. Installation does not capture every conversation automatically.
 
-1. 요청에 명시된 볼트 경로 (`--vault`)
-2. `OBSIDIAN_VAULT_PATH`
-3. 문서화된 기본값 `~/Documents/Obsidian Vault` — **디렉터리가 실제 존재할 때만**
+Record only information available in the current session or explicitly supplied sources. Never collect hidden reasoning, system/developer instructions, credentials, or unavailable content. Label each claim as observed, user-reported, inferred, intended, or verified. A user statement alone is not verification.
 
-**볼트를 해석할 수 없으면 쓰기 전에 멈춘다.** 무엇이 없고 어디를 확인했는지 보고한다. `~/.history`, 프로젝트 폴더, 추측한 경로로는 절대 기록하지 않는다. 시작할 때 실제 저장 경로를 사용자에게 알린다.
+## 1. Resolve the vault before writing
 
-## 2. 기록 범위와 비밀 처리
+Use this order:
 
-- 기록 대상: 실제 사용자 메시지, 요구사항 변경, 첨부 문서, 참조 자료, AI가 실행 도구에 전달한 프롬프트와 옵션, 공개된 계획·결정 근거, 도구 결과·오류, 검증 결과, 중간 및 최종 산출물, 사용자 피드백·승인, 재개·납품 기록.
-- 접근 가능한 데이터만 기록한다. 숨겨진 사고 과정, 시스템/개발자 지침, 자격증명은 수집하지 않는다. 비밀값이 섞이면 값만 `[REDACTED]`로 치환하고 치환 사실을 기록한다. 원본 비밀 파일은 스냅샷에 넣지 않는다.
-- CLI는 지원하는 텍스트의 알려진 비밀 형식(GitHub/API/AWS/Slack 토큰, Bearer/JWT, 자격증명 포함 DB URL, 개인키 블록)을 저장 전 결정적으로 치환하고, 모호한 내용은 그 이벤트를 거부한다. 이 검사는 완전한 스캔이 아니므로 호출 전에도 비밀값을 제외한다. 바이너리 아티팩트는 승인된 로컬 스캐너 없이 복사하지 않으며 `event.json`의 `excluded_artifacts`에 명시한다.
-- 다른 세션의 대화, 제공되지 않은 첨부, 도구가 생략한 응답은 복구한 것처럼 꾸미지 않는다. 누락 범위와 이유를 기록에 적는다.
-- 모든 주장은 관찰·사용자 보고·추론·의도·검증 중 하나로 구분한다. 관찰하지 않은 완료나 산출물을 사실로 적지 않는다.
-- 바이너리·미지원 인코딩 아티팩트는 바이트를 복사하지 않는다. 대신 `records.csv`에 스냅샷 없는 출처 행(`snapshot_path`/`sha256` 빈 값)과 `links.csv` 관계(`used`/`produced`)를 남기고 `event.json`의 `excluded_artifacts`에 `record_id`·소스 다이제스트·사유를 기록한다.
+1. Vault path explicitly supplied by the user (`--vault`).
+2. `OBSIDIAN_VAULT_PATH`.
+3. The documented default `~/Documents/Obsidian Vault`, only if it exists.
 
-## 3. 변경 전에 원문을 보존한다
+If no vault resolves, stop before creating any file. Report the locations checked and missing configuration. Never fall back to `~/.history`, the project directory, a guessed path, or another user's hard-coded path. State the resolved destination before recording.
 
-사용자의 새로운 입력을 받은 즉시 UTF-8 임시 MD를 작성하고 `record`를 실행한다. 형식과 CLI 상세는 [references/record-format.md](references/record-format.md)를 읽는다.
+Read vault-root instructions and relevant templates. Inspect `Work History/` for an existing project identity before recording. The CLI reuses a `project.json` mapping and can adopt the prior skill's exact display-name folder only when its README heading is `# <Project> — Work History`; other unmarked folders are not silently remapped. Do not rename or overwrite legacy notes. If the folder identity is ambiguous, report the conflict instead of creating a competing project history.
+
+## 2. Capture an event and its provenance
+
+Resolve the vault first, then write a UTF-8 temporary Markdown source containing the accessible user request, relevant execution prompt and options, observed response/tool results, decisions, errors, validation, and known gaps. Preserve exact source text only when available, relevant, permitted by vault rules, and screened for secrets. Distinguish the user's request from any prompt rewritten for a generation tool. See [record-format.md](references/record-format.md) for the source template and schema.
+
+Create the event with `scripts/history.py`:
 
 ```text
-python <이-스킬-경로>/scripts/history.py record --vault <볼트> --project "<프로젝트>" \
-  --title "초기 요구사항" --kind requirement --status received --text-file <원문.md> --tool omp
+python <skill-path>/scripts/history.py record --vault <vault> \
+  --project "<canonical project identity>" \
+  --title "<short factual title>" --kind requirement --status received \
+  --text-file <temporary-source.md> --tool <observed tool>
 ```
 
-CLI가 반환한 `event_id`를 이후 이벤트의 `--parent`에 사용한다. 볼트의 로컬 시간대가 확정되어 있으면 `--timezone`(IANA) 또는 `--utc-offset=±HH:MM`(음수는 `=` 구문 필수)을 지정하고, 모르면 생략해 `UTC`로 명확히 표기한다 — 날짜 경계를 추측하지 않는다. 과거 메시지의 원래 시각을 아는 경우 MD에 별도 기재하며, 모르면 `unknown`으로 적는다.
+Use `record --help` for the supported `kind`/`status` values and optional `--model`, `--version`, `--input`, `--document`, `--output`, and repeated `--parent` flags.
 
-## 4. 실행과 산출물을 연결한다
+- Record a meaningful step as its own event. Use the returned `event_id` as `--parent` on the next event to preserve sequence and provenance.
+- Attach existing inputs/documents with `--input`/`--document`. Attach an output with `--output` only after confirming the file exists. When recording outputs, provide the actual version with `--version`; never invent version numbers.
+- Use observed tool/model values; leave unknown values blank. The CLI redacts supported secret patterns and refuses ambiguous text, but this is not a complete secret scanner. Screen the content before calling it.
+- Never copy unscanned binary data. The CLI records an explicit exclusion and source digest without claiming that bytes were preserved.
+- Preserve interruptions. A resumed operation is a new `kind=resume` event with a valid status (`started`, `completed`, or `failed`) and the prior `interrupted` event as parent. `resumed` is not a valid status. Record completion only with observed evidence.
+- If the only evidence of a resumed attempt or completion is the user's statement, do not invent a started/completed resume event. Record that statement as received/user-reported, link it to the interrupted event, and leave the operation unverified until observable evidence is available.
+- If the vault timezone is documented, pass `--timezone` (IANA) or `--utc-offset=±HH:MM`. Otherwise keep the CLI's explicitly labeled `UTC` date; do not guess across midnight.
 
-1. **실행 전:** 실제 실행 프롬프트, 모델명, 매개변수, 참조 파일을 MD에 남긴다. `--kind prompt --status started`로 기록하고 참조 파일은 `--input` 또는 `--document`로 스냅샷한다.
-2. **실행 후:** 응답 원문·도구 결과·오류·검증 결과를 기록한다. 시작 이벤트를 부모로 연결하고 실제 파일을 `--output`으로 등록한다. 외부 URL만 있으면 파일 확보 전까지 로컬 보존 완료로 표시하지 않는다.
-3. **수정 전:** 새 요구사항은 독립 이벤트로 기록하고 다음 실행은 이 요구사항과 이전 산출물 이벤트를 모두 부모로 연결한다.
-4. **버전:** 산출물이 있으면 `--version v0001`처럼 명시한다.
-5. **실패·중단·재개:** `failed` 또는 `interrupted`로 기록한다. 재개는 `kind=resume`과 유효 상태(`started`/`completed`/`failed`)의 **새 이벤트**로 남기고 이전 `interrupted` 이벤트를 `--parent`로 연결한다. `resumed`라는 상태는 없다. 중단 사실을 지우고 완료로 다시 쓰지 않는다.
+## 3. Generate the project/date history
 
-기록된 스냅샷은 수정하지 않는다. 정정·삭제 요청·승인 변경은 새 이벤트로 연결한다.
+After publishing the event or a batch of events, refresh the event CSV snapshot and Obsidian views:
 
-## 5. 납품 전에 대조한다
+```text
+python <skill-path>/scripts/history.py index --vault <vault>
+python <skill-path>/scripts/obsidian_index.py index --vault <vault>
+```
 
-- 모든 접근 가능한 입력·프롬프트·문서·결과·버전이 이벤트에 연결되어 있는지 대조한다. 제외된 바이너리는 제외 사실과 이유를 보고한다.
-- `python <이-스킬-경로>/scripts/history.py index --vault <볼트>`로 전체 CSV 스냅샷을 갱신한다. 이 CSV는 조회용이고 원본은 각 이벤트 번들이다.
-- 시간순 조회는 CSV의 `recorded_at`(UTC)을 사용한다. 볼트의 날짜별 위치는 `local_date`/`timezone`이 결정하며 둘은 다를 수 있다.
-- 실제 기록 경로, 최종 버전 스냅샷 경로, 인덱스 경로, 누락·미완료·부분 실패를 그대로 보고한다.
+`history.py index` writes query snapshots. `obsidian_index.py index` generates the global project index, per-project and per-year navigation, and one date note for each project/date. See [obsidian-layout.md](references/obsidian-layout.md).
 
-## 6. 레거시 기록(읽기 전용)
+The generated project and date notes are views, not the canonical record. Do not edit their managed blocks by hand. The indexer preserves unmanaged frontmatter/prose, serializes writers, and aborts on ambiguous markers, path conflicts, or concurrent edits. Re-run it only after inspecting the reported conflict and current files.
 
-`~/.history/`와 프로젝트 `.history/`는 기본적으로 읽기 전용 증거이며 자동 이동·삭제·덮어쓰기하지 않는다. 재개 시 관련 증거만 읽어 출처 경로를 명시해 이어서 기록한다. 대량 가져오기는 사용자의 명시적 요청과 검토된 dry-run 이후에만 별도 절차로 수행한다.
+Wikilink identity is its normalized destination, not its alias or surrounding bullet text. The indexer checks preserved prose and managed content together; if a destination already exists, it emits context without another link. For any vault-convention-required manual backlink outside generated views, scan the entire target note for the normalized destination before adding it. Do not add a second link because the new activity text differs.
 
-## 도구가 없는 환경
+## 4. Read or continue legacy history
 
-Python 실행이 불가능하지만 파일 쓰기가 가능하면 `references/record-format.md`의 스키마로 직접 기록한다. 파일 저장 자체가 불가능하면 저장했다고 말하지 말고 내용을 제공하면서 저장 불가를 명시한다.
+Treat `~/.history/` and project-local `.history/` as read-only unless the user explicitly requests migration.
+
+- Project-local `.history/` is continuity evidence only. Read only the relevant operation's status and events, cite the source paths in the new event, preserve the interrupted state, and do not append, delete, or bulk-import it. Its local event IDs are not valid `--parent` values unless a matching event bundle already exists in this vault.
+- `~/.history/` event bundles can be imported only after the user requests migration, `inspect` and a mapped `dry-run` are reviewed, and the user explicitly approves import. `import` requires `--approve`; never infer approval from a general logging request.
+- Never import `.pending-*` staging directories. Unmapped, corrupt, secret-bearing, or unsupported records remain unimported and are reported.
+
+Read [migration.md](references/migration.md) before running legacy commands. A successful import does not rebuild views; run `obsidian_index.py index` afterward.
+
+## 5. Verify and report honestly
+
+Before reporting completion:
+
+1. Confirm the returned event ID, event path, project identity, local date/timezone, parent IDs, and attached/excluded artifacts.
+2. Confirm both index commands' results. Re-read/list the generated paths; verify project/date placement, preserved prose, and no duplicate wikilink destinations.
+3. If event publication succeeded but index generation failed, report the event as published and the views as stale/partial. Name the exact files written, conflicts, and recovery action. Do not claim “fully logged.”
+4. Report the actual vault path, event/index paths, versioned outputs, exclusions, redactions, missing evidence, and blockers. Do not claim that a history entry proves successful QA or acceptance.
+
+Snapshots are conventionally immutable, not protected by WORM storage. The indexer’s managed-block and conflict guarantees are documented in [obsidian-layout.md](references/obsidian-layout.md).

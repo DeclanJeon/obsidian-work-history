@@ -460,6 +460,20 @@ class ObsidianIndexTests(unittest.TestCase):
         self.assertFalse((self.base / "escape.md").exists())
         self.assertFalse((self.vault.parent / "escape.md").exists())
 
+    def test_indexer_refuses_windows_junction_component(self):
+        module = load_index_module()
+        junction_like = self.root() / "Junction"
+        junction_like.mkdir(parents=True)
+        real_check = history.is_link_or_junction
+
+        def junction_check(path):
+            return Path(path) == junction_like or real_check(path)
+
+        with mock.patch.object(history, "is_link_or_junction",
+                               side_effect=junction_check):
+            with self.assertRaisesRegex(ValueError, "refusing symlinked path"):
+                module.ensure_inside_vault(junction_like, self.vault)
+
     def test_symlinked_note_target_is_refused(self):
         result = self.record()
         slug = self.slug_of("프로젝트A")

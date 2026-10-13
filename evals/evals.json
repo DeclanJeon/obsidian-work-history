@@ -1,0 +1,82 @@
+{
+  "skill_name": "obsidian-work-history",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Log this work session in my Obsidian vault: I implemented a dark-mode toggle for Example App and added src/theme.py. Record the work, decisions, and next steps.",
+      "expected_output": "When no vault can be resolved, stop before creating any file, report the checked locations/configuration, and label src/theme.py as user-reported/unverified because it is absent.",
+      "files": ["evals/fixtures/unknown-vault-project/src/app.py"],
+      "expectations": [
+        "No .history or other fallback file is created.",
+        "The missing src/theme.py is not listed as verified output.",
+        "The response identifies that the Obsidian vault could not be resolved."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Log this session to my Obsidian vault: we resumed and finished rendering the demo-scene animatic for Example Project; the output is now outputs/demo_scene_animatic.mp4.",
+      "expected_output": "Read the relevant project-local .history evidence read-only, preserve the interrupted attempt and cite source paths. The stated output is absent, so label it user-reported/unverified and do not claim a verified completion. Record only in the provided synthetic vault.",
+      "files": [
+        "evals/fixtures/legacy-project/project.json",
+        "evals/fixtures/legacy-project/.history/STATUS_SNAPSHOT.md",
+        "evals/fixtures/legacy-project/.history/events/000001-20261012T033117-render-demo-scene-started.md",
+        "evals/fixtures/legacy-project/.history/events/000002-20261012T034802-render-demo-scene-interrupted.md",
+        "evals/fixtures/legacy-project/outputs/.gitkeep",
+        "evals/fixtures/empty-vault/.keep"
+      ],
+      "expectations": [
+        "The project-local .history tree remains byte-identical.",
+        "The prior interrupted state and source event paths are carried forward.",
+        "No completed output is claimed because the MP4 is absent.",
+        "The new record is written only to the resolved synthetic Obsidian vault."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Log this session to my vault: for Example Project I added a metrics aggregator and fixed timezone normalization. Update my work history.",
+      "expected_output": "Record an event without claiming unobserved completion, reuse the exact legacy project folder whose README heading identifies Example Project, preserve prior frontmatter/prose, then regenerate indexes. Do not list outputs/report.csv because it is absent.",
+      "files": [
+        "evals/fixtures/same-day-vault/_CLAUDE.md",
+        "evals/fixtures/same-day-vault/Work History/Example Project/README.md",
+        "evals/fixtures/same-day-vault/Work History/Example Project/2026/2026-10-13.md",
+        "evals/fixtures/example-project/scripts/metrics_aggregator.py",
+        "evals/fixtures/example-project/outputs/.gitkeep"
+      ],
+      "expectations": [
+        "Existing note frontmatter and prose are preserved verbatim.",
+        "The event path uses Work History/Example Project rather than creating a second hashed project folder.",
+        "The event/date view is regenerated through obsidian_index.py.",
+        "An absent report.csv is not recorded as a verified output."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "For project A, log this received work note in my Obsidian vault and refresh the project/date indexes. The project mapping exists, but its README path is already a directory because of a pre-existing conflict.",
+      "expected_output": "Publish the immutable event if safe, then run indexing. The indexer must reject the README directory conflict; report the event as published and the views as incomplete/stale, name the conflict and recovery action, and never claim full success.",
+      "files": [
+        "evals/fixtures/partial-index-vault/Work History/A-559aead082/project.json",
+        "evals/fixtures/partial-index-vault/Work History/A-559aead082/README.md/.keep"
+      ],
+      "expectations": [
+        "The injected README directory conflict is not overwritten.",
+        "The response distinguishes event publication from failed view generation.",
+        "The response reports the exact blocker and a safe recovery step."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "For Example Project, record another work-history event for 2026-10-13. Its existing project README already links to [[Work History/Example Project/2026/2026-10-13|2026-10-13]]; add the new context without duplicating that destination, even if the surrounding text differs.",
+      "expected_output": "Reuse the existing exact project identity and regenerate views. The project README contains the target destination at most once; prior content remains unchanged, and no duplicate same-day note is created.",
+      "files": [
+        "evals/fixtures/same-day-vault/_CLAUDE.md",
+        "evals/fixtures/same-day-vault/Work History/Example Project/README.md",
+        "evals/fixtures/same-day-vault/Work History/Example Project/2026/2026-10-13.md"
+      ],
+      "expectations": [
+        "The normalized destination Work History/Example Project/2026/2026-10-13 appears at most once in the project README.",
+        "Existing project/date note content is preserved.",
+        "No same-day duplicate file is created."
+      ]
+    }
+  ]
+}
