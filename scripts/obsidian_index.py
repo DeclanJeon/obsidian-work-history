@@ -227,17 +227,23 @@ def read_bundles(vault, project_folder=None):
                 f"path {date}: {folder}")
         for row in records:
             validate_snapshot_path(row.get("snapshot_path") or "")
+        # absent or explicit null means "no exclusions"; any other supplied
+        # value must be a list of dicts with unique record_ids.
+        raw = event_json.get("excluded_artifacts")
         exclusions = {}
-        raw = event_json.get("excluded_artifacts") or []
-        if not isinstance(raw, list):
-            raise ValueError(
-                f"event.json excluded_artifacts must be a list: {folder}")
-        exclusions = {}
-        for item in raw:
-            if not isinstance(item, dict) or not item.get("record_id"):
+        if raw is not None:
+            if not isinstance(raw, list):
                 raise ValueError(
-                    f"malformed excluded_artifacts entry: {folder}")
-            exclusions[item["record_id"]] = item
+                    f"event.json excluded_artifacts must be a list: {folder}")
+            for item in raw:
+                if not isinstance(item, dict) or not item.get("record_id"):
+                    raise ValueError(
+                        f"malformed excluded_artifacts entry: {folder}")
+                if item["record_id"] in exclusions:
+                    raise ValueError(
+                        f"duplicate excluded_artifacts record_id "
+                        f"{item['record_id']}: {folder}")
+                exclusions[item["record_id"]] = item
         artifacts = []
         for row in records:
             if row.get("role") == "event":
