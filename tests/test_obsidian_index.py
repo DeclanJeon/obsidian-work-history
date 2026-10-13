@@ -756,18 +756,19 @@ class ObsidianIndexTests(unittest.TestCase):
     def test_main_reports_partial_state_on_late_conflict(self):
         self.record(title="first")
         self.view()
-        second = self.record(title="second")
+        self.record(title="second")
         module = load_index_module()
-        events_csv = self.root() / "_index" / "events.csv"
         original = module.atomic_write
         calls = {"n": 0}
+        raced_path = []
 
         def racing_write(path, content, expected_sha256):
             calls["n"] += 1
             if calls["n"] == 2:
                 # External edit lands mid-staging on the second update —
                 # the first update is already published.
-                Path(path).write_text("raced\n", encoding="utf-8")
+                raced_path.append(Path(path))
+                raced_path[0].write_text("raced\n", encoding="utf-8")
             return original(path, content, expected_sha256)
 
         stderr = io.StringIO()
@@ -789,9 +790,9 @@ class ObsidianIndexTests(unittest.TestCase):
         for path in report["written"] + report["conflicts"]:
             self.assertFalse(Path(path).is_absolute(), path)
             self.assertTrue(str(path).startswith("Work History"), path)
-        self.assertEqual(
-            events_csv.read_text(encoding="utf-8"), "raced\n",
-            "the raced target keeps the external edit, never overwritten")
+        self.assertTrue(raced_path)
+        self.assertEqual(raced_path[0].read_text(encoding="utf-8"), "raced\n",
+                         "the raced target keeps the external edit, never overwritten")
 
     # --- Incomplete bundles fail safely ---
 
