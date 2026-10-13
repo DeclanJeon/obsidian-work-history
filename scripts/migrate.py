@@ -256,7 +256,6 @@ def analyze_event(root, rel, folder):
 
     secret_hits = 0
     ambiguous = False
-    text_files = []
     for text_path, label in ((annotated_path, stem + ".md"),
                              (original_path, stem + "_원문.md")):
         data = text_path.read_bytes()
@@ -268,7 +267,6 @@ def analyze_event(root, rel, folder):
         hits, bad = secret_report(text)
         secret_hits += hits
         ambiguous = ambiguous or bad
-        text_files.append((text_path, label))
 
     exclusions = []
     snapshots = []
@@ -287,6 +285,10 @@ def analyze_event(root, rel, folder):
             raise EventProblem(
                 f"row {row['record_id']} has snapshot_path but no sha256")
         source_file = resolve_source_snapshot(root, snapshot)
+        if row.get("role") == "event" and source_file != original_path:
+            raise EventProblem(
+                f"event row snapshot {snapshot!r} is not the event's "
+                f"*_원문.md original snapshot")
         data = source_file.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         claimed = row.get("sha256") or ""
