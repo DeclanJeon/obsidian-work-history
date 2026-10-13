@@ -59,23 +59,33 @@ class EventProblem(Exception):
 def classify_source(path):
     """Classify a legacy store without modifying it.
 
+    Project-local continuity markers dominate; an ``events/`` directory of
+    event-bundle dirs (or an empty/pending-only one, the global store's
+    on-disk shape) classifies as a global event store; anything else is
+    unrecognized.
+
     Returns global_event_store | project_local_continuity | unrecognized.
     """
     path = Path(path)
     if not path.is_dir():
         return "unrecognized"
     events = path / "events"
+    has_local_markers = ((path / "STATUS_SNAPSHOT.md").is_file()
+                         or (path / "prompts").is_dir())
     if events.is_dir():
+        entries = list(events.iterdir())
         has_bundle_dirs = any(e.is_dir() and not e.name.startswith(".")
-                              for e in events.iterdir())
-        has_notes = any(e.is_file() and e.suffix == ".md"
-                        for e in events.iterdir())
-        if has_bundle_dirs:
+                              for e in entries)
+        has_notes = any(e.is_file() and e.suffix == ".md" for e in entries)
+        if has_bundle_dirs and not has_notes and not has_local_markers:
             return "global_event_store"
-        if has_notes or (path / "STATUS_SNAPSHOT.md").is_file() \
-                or (path / "prompts").is_dir():
+        if has_notes or has_local_markers:
             return "project_local_continuity"
-    if (path / "STATUS_SNAPSHOT.md").is_file() or (path / "prompts").is_dir():
+        if not has_notes:
+            # Empty or pending-only events/: the global event store's
+            # resting shape (a fresh --root has an empty events/).
+            return "global_event_store"
+    if has_local_markers:
         return "project_local_continuity"
     return "unrecognized"
 
