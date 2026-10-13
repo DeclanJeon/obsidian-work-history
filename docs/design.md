@@ -1,6 +1,6 @@
 # Unified Obsidian Work History — Approved Design and QA
 
-**Status:** Approved design; implementation, 80-test suite, five paired synthetic evaluations, public release, and installed-skill cutover verified. Legacy GitHub repository retirement remains incomplete until deletion is confirmed on GitHub.
+**Status:** Approved design; implementation, 80-test suite, five paired synthetic evaluations, public release, installed-skill cutover, and deletion of both predecessor GitHub repositories verified.
 **Scope decision:** Combine only the `history-skills` and `obsidian-project-history` skill projects. Do not integrate TraceForge, Work Blackbox, LatticeMind, or other repositories.
 **Repository/skill name:** `obsidian-work-history`.
 
@@ -160,8 +160,8 @@ The reviewed source CLI is Python 3.10+ standard-library code; current GitHub li
 
 ## 13. Release verification
 
-- Public repository: `https://github.com/DeclanJeon/obsidian-work-history`; visibility `PUBLIC`; default branch `main`; first published commit `200213d0814e66345ea168eed22a57beb5a997f0`.
+- Public repository: `https://github.com/DeclanJeon/obsidian-work-history`; visibility `PUBLIC`; default branch `main`; initial published implementation commit `200213d0814e66345ea168eed22a57beb5a997f0`; release-status update pushed at `ab95bdc6748141cc0cc93f4b1c6f288328172398`.
 - A fresh clone of that commit passed all 80 tests. `migrate.py inspect` classified the synthetic project-local `.history` fixture as read-only continuity evidence.
 - The installed `obsidian-work-history` skill files were byte-identical to the public commit. An isolated installed-skill smoke published one synthetic event and refreshed both CSV and Obsidian indexes.
 - Both old public repositories have private all-ref mirrors and complete-history bundles; bundle verification and restore-clone ref comparison passed.
-- **Not complete:** GitHub readback still showed both legacy repositories public on their backed-up `main` commits. The first delete request was rejected for missing authorization; no deletion is claimed. Delete only the two approved targets after authorization, then read back both absence states.
+- **Complete:** Following explicit owner authorization, both approved legacy repositories were deleted. Authenticated GitHub API reads returned HTTP 404 `Not Found` for both at `2026-10-13 03:41:52 GMT`. Private full-history backups and restore checks were completed before deletion.
