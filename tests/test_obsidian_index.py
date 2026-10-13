@@ -709,6 +709,10 @@ class ObsidianIndexTests(unittest.TestCase):
              [good_exclusion]),
             ("excluded_artifacts not a list", {}, {"record_id": "r1"}),
             ("excluded_artifacts entry not a dict", {}, ["r1"]),
+            ("duplicate exclusion record_id", {},
+             [{**good_exclusion, "reason": "first reason"},
+              {**good_exclusion, "reason": "different reason",
+               "sha256": "b" * 64}]),
         ]
         for name, row_overrides, exclusions in variants:
             with self.subTest(variant=name):
@@ -750,6 +754,58 @@ class ObsidianIndexTests(unittest.TestCase):
         self.run_cli(SCRIPT, "index", "--vault", vault)
         note = (vault / "Work History" / slug / "2026" / f"{date}.md")
         self.assertIn("excluded", note.read_text(encoding="utf-8").lower())
+
+    # --- Review: malformed excluded_artifacts container ---
+
+    def test_nonlist_excluded_artifacts_container_fails_closed(self):
+        """Any supplied excluded_artifacts that is not a list must fail —
+        only an absent key or null may default to 'no exclusions'. This
+        isolates container validation from missing-metadata checks."""
+        slug = "craft-" + "c" * 10
+        date = "2026-10-13"
+        event_id = "3" * 32
+        bundle = f"Work History/{slug}/2026/Events/{date}/{event_id}"
+        base_json = {"schema_version": 1, "project": "craft",
+                     "project_slug": slug,
+                     "recorded_at": "2026-10-13T12:00:00+00:00",
+                     "local_date": date, "timezone": "UTC", "title": "t",
+                     "kind": "execution", "status": "completed",
+                     "parents": [], "artifacts": []}
+        for name, value in (("empty dict", {}), ("empty string", ""),
+                            ("zero", 0)):
+            with self.subTest(container=name):
+                vault = self.base / f"vault-container-{name.replace(' ', '-')}"
+                vault.mkdir()
+                rows = [self.base_row("craft", event_id,
+                                      snapshot_path=f"{bundle}/original.md",
+                                      sha256="0" * 64)]
+                self.write_bundle(
+                    slug, date, event_id, rows, [],
+                    event_json={**base_json, "event_id": event_id,
+                                "excluded_artifacts": value},
+                    vault=vault)
+                error = self.run_cli(SCRIPT, "index", "--vault", vault,
+                                     ok=False)
+                self.assertIn("error", error)
+                index_dir = vault / "Work History" / "_index"
+                self.assertFalse((index_dir / "events.csv").exists())
+                self.assertFalse((index_dir / "projects.md").exists())
+        # Absent/null key is the documented default for 'no exclusions'.
+        for name, value in (("absent", "ABSENT"), ("null", None)):
+            with self.subTest(container=name):
+                vault = self.base / f"vault-container-ok-{name}"
+                vault.mkdir()
+                rows = [self.base_row("craft", event_id,
+                                      snapshot_path=f"{bundle}/original.md",
+                                      sha256="0" * 64)]
+                event_json = {**base_json, "event_id": event_id}
+                if value != "ABSENT":
+                    event_json["excluded_artifacts"] = value
+                self.write_bundle(slug, date, event_id, rows, [],
+                                  event_json=event_json, vault=vault)
+                self.run_cli(SCRIPT, "index", "--vault", vault)
+                self.assertTrue((vault / "Work History" / "_index"
+                                 / "events.csv").is_file())
 
     # --- Review: late-conflict partial-state reporting via CLI ---
 
